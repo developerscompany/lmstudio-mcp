@@ -62,7 +62,7 @@ Sessions, tasks and model defaults are kept in `~/.lmstudio-mcp` (files readable
 
 For LM Studio on the same computer there is nothing to set: the server reads the port from `lms server status`. Without `lms` it uses `http://127.0.0.1:1234`; LM Studio Bionic listens on 1235 by default, so set the URL in that case.
 
-When you enable the plugin, Claude Code asks for two optional settings (change them later in `/plugin`):
+The plugin has two optional settings. Claude Code may say they are "not yet set"; leave them empty for LM Studio on the same computer, or set them with `/plugin configure lmstudio@lmstudio-mcp`:
 
 - **LM Studio URL**: only for LM Studio on another machine, or without `lms`.
 - **API token**: only if API authentication is on in LM Studio. It is kept in the system keychain.
