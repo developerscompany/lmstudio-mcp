@@ -2,7 +2,7 @@
 
 Let Claude Code run your [LM Studio](https://lmstudio.ai): start and stop the server, load and unload models with the context length they need, keep conversations with local models going, hand them long jobs in the background and follow their progress.
 
-It is a Claude Code plugin with one small MCP server: a single file with no dependencies that needs only Node.js 18+. The server also works with any other MCP client.
+It is a Claude Code plugin with one small MCP server: a single file with no dependencies that needs only Node.js 20 or newer. The server also works with any other MCP client.
 
 > Not affiliated with LM Studio or Element Labs.
 
@@ -31,7 +31,7 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 **Requirements**
 
 - LM Studio 0.4 or newer (REST API v1), or LM Studio Bionic
-- Node.js 18+
+- Node.js 20 or newer (tested on 20, 22, 24 and 26)
 - The `lms` CLI that ships with LM Studio, for starting and stopping the server, memory estimates and loads with TTL or GPU settings. Everything else works over the API alone.
 
 ## Tools
@@ -50,7 +50,7 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 
 **Context control.** `model_defaults` stores the settings a model should always be loaded with, for example `context_length: 262144` for a model that only works well with its full context. `load_model`, `chat`, sessions and tasks use them whenever a call doesn't say otherwise. A session never runs on an instance with less context than it needs: if the model is loaded with a smaller context, the call stops and asks for `reload: true`, which unloads it and loads it again. `load_model` keeps a model that is already loaded unless you pass `replace: true`, and parallel calls for a model that isn't loaded yet wait for one load, so a second copy of a 90 GB model is never loaded by accident. A model that a session request or task is using is never unloaded or reloaded under it.
 
-**Sessions.** `session_start` loads the model if needed and opens a conversation; `session_send` adds a message. LM Studio keeps the conversation on its side (`store` and `previous_response_id` of its chat API), so only the new message is sent each time. Every answer reports how full the context is, for example `45,210 / 262,144 tokens (17%)`, and warns from 80%. `session_compact` asks the model to summarize the conversation; the next message starts a fresh context that begins with that summary. A session handles one request at a time, also when several Claude Code sessions use it. If LM Studio has lost a conversation (for example after a restart), the next message rebuilds it from the saved transcript. Sessions can give the local model LM Studio plugins or MCP servers configured in LM Studio through `integrations` (for example `"mcp/github"`); the tool calls it makes are shown with the answer.
+**Sessions.** `session_start` loads the model if needed and opens a conversation; `session_send` adds a message. LM Studio keeps the conversation on its side (`store` and `previous_response_id` of its chat API), so only the new message is sent each time. Every answer reports how full the context is, for example `45,210 / 262,144 tokens (17%)`, and warns from 80%. `session_compact` asks the model to summarize the conversation; the next message starts a fresh context that begins with that summary. A session handles one request at a time, also when several Claude Code sessions use it. LM Studio deletes stored conversations after 30 days; when it no longer has one, the next message rebuilds it from the saved transcript and says so. Sessions can give the local model LM Studio plugins or MCP servers configured in LM Studio through `integrations` (for example `"mcp/github"`); the tool calls it makes are shown with the answer.
 
 **Tasks.** `task_start` runs a message in a new or existing session in the background and returns a task id at once. `task_status` shows the phase (loading model, reading prompt with a percentage, thinking, calling a tool, answering), the answer so far and, when done, the full result; `wait_seconds` waits for it. `task_cancel` stops it. Tasks run inside the MCP server, so they stop when the Claude Code session that started them ends; they are then marked as interrupted. Other Claude Code sessions can see their status and cancel them. Finished tasks are kept for 14 days (at most 200).
 
@@ -93,7 +93,7 @@ Claude Desktop, Cursor and other clients:
 ```json
 {
   "mcpServers": {
-    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.1.0"] }
+    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.1.1"] }
   }
 }
 ```
@@ -113,7 +113,7 @@ claude plugin validate . --strict
 claude --plugin-dir .             # try the plugin without installing it
 ```
 
-The whole server is [`server/lmstudio-mcp.mjs`](server/lmstudio-mcp.mjs): MCP over stdio (JSON-RPC 2.0), protocol versions 2024-11-05 to 2025-11-25. The tests need Node.js 18.13 or newer.
+The whole server is [`server/lmstudio-mcp.mjs`](server/lmstudio-mcp.mjs): MCP over stdio (JSON-RPC 2.0), protocol versions 2024-11-05 to 2025-11-25.
 
 ## License
 

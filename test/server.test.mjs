@@ -1,7 +1,7 @@
 // Runs the MCP server against a fake LM Studio (REST API with streaming) and a fake `lms` CLI. Run with: npm test
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -77,9 +77,10 @@ const routes = {
       })),
     },
   ],
-  "POST /api/v1/models/load": async (body) => {
-    if (body.model === "slow-llm") await delay(2500);
-    return load(body);
+  "POST /api/v1/models/load": async (body, req) => {
+    if (body.model !== "slow-llm") return load(body);
+    await delay(2500);
+    return req.socket.destroyed ? [499, {}] : load(body); // the client gave up: nothing gets loaded
   },
   "POST /__lms/load": (body) => load(body),
   "POST /__forget": () => {
@@ -102,13 +103,17 @@ const routes = {
 
 // POST /api/v1/chat: answers "Answer <n> to: <text>", where n counts the turns of the conversation.
 // "[slow]" / "[very slow]" in the text slow the stream down, "[fill]" reports 85% of the context as used,
-// "[error]" fails.
+// "[error]" fails during the answer and "[bad request]" is refused with HTTP 400.
 async function chat(body, res) {
   const instance = loaded.get(body.model);
   if (!instance) return send(res, 404, { error: { type: "model_not_found", message: `Model ${body.model} is not loaded` } });
-  if (body.previous_response_id && !chains.has(body.previous_response_id)) return send(res, 400, { error: { type: "invalid_request", message: "Unknown previous_response_id" } });
+  if (body.previous_response_id && !chains.has(body.previous_response_id)) {
+    const message = `Could not find stored response for previous_response_id '${body.previous_response_id}'. Please ensure the ID is correct.`;
+    return send(res, 400, { error: { message, type: "invalid_request", param: "previous_response_id", code: "invalid_value" } });
+  }
   const depth = (chains.get(body.previous_response_id) ?? 0) + 1;
   const text = typeof body.input === "string" ? body.input : body.input.find((item) => item.type === "text").content;
+  if (text.includes("[bad request]")) return send(res, 400, { error: { message: "Invalid response format", type: "invalid_request", param: "input" } });
   const answer = text.startsWith("Summarize our conversation") ? "SUMMARY: we talked." : `Answer ${depth} to: ${text}`;
   const toolCall = { tool: "search", arguments: { q: "x" }, output: "found", provider_info: { type: "plugin", plugin_id: body.integrations?.[0] } };
   const result = {
@@ -160,7 +165,7 @@ const api = createServer(async (req, res) => {
   requests.push({ method: req.method, url: req.url, body, auth: req.headers.authorization });
   if (req.method === "POST" && req.url === "/api/v1/chat") return chat(body, res);
   const route = routes[`${req.method} ${req.url}`];
-  const [status, payload] = route ? await route(body) : [404, { error: `Unexpected endpoint or method. (${req.method} ${req.url})` }];
+  const [status, payload] = route ? await route(body, req) : [404, { error: `Unexpected endpoint or method. (${req.method} ${req.url})` }];
   send(res, status, payload);
 });
 let port;
@@ -202,6 +207,7 @@ const stopped = process.env.FAKE_LMS_STOPPED_PORT;
 after(() => {
   api.closeAllConnections();
   api.close();
+  rmSync(work, { recursive: true, force: true });
 });
 
 beforeEach(() => {
@@ -369,6 +375,15 @@ test("a slow REST call ends with a timeout message", async (t) => {
   const result = await c.call("load_model", { model: "slow-llm" });
   assert.equal(result.isError, true);
   assert.match(result.text, /did not respond to POST \/api\/v1\/models\/load for 1 s/);
+});
+
+test("the version is the same everywhere", () => {
+  const root = join(dirname(SERVER), "..");
+  const version = execFileSync(process.execPath, [SERVER, "--version"], { encoding: "utf8" }).trim();
+  assert.equal(JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version, version);
+  assert.equal(JSON.parse(readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8")).version, version);
+  assert.match(readFileSync(join(root, "README.md"), "utf8"), new RegExp(`lmstudio-mcp#v${version.replaceAll(".", "\\.")}"`));
+  assert.match(readFileSync(join(root, "CHANGELOG.md"), "utf8"), new RegExp(`^## ${version.replaceAll(".", "\\.")} `, "m"));
 });
 
 // ---------- server ----------
@@ -729,6 +744,43 @@ test("a session continues from its saved transcript when LM Studio lost the conv
   assert.match(compactBody.input, /\n\nConversation:\nUser: first\n\nAssistant: Answer 1 to: first/);
 });
 
+test("a refused request that is not about the conversation is reported, not retried", async (t) => {
+  const c = session(t);
+  const { session_id } = (await c.call("session_start", { model: "tiny-llm" })).json();
+  await c.call("session_send", { session_id, message: "first" });
+  const before = sent("/api/v1/chat").length;
+  const refused = await c.call("session_send", { session_id, message: "[bad request]" });
+  assert.equal(refused.isError, true);
+  assert.match(refused.text, /HTTP 400 invalid_request\): Invalid response format/);
+  assert.equal(sent("/api/v1/chat").length, before + 1);
+  assert.match((await c.call("session_send", { session_id, message: "second" })).text, /^Answer 2 to: second/);
+});
+
+test("a rebuilt conversation keeps the end of a very long last turn and still warns about a full context", async (t) => {
+  const c = session(t);
+  const { session_id } = (await c.call("session_start", { model: "tiny-llm" })).json(); // 4096 tokens
+  await c.call("session_send", { session_id, message: `start ${"x".repeat(6000)} END-OF-FIRST` });
+  await fetch(`http://127.0.0.1:${port}/__forget`, { method: "POST" });
+  const next = await c.call("session_send", { session_id, message: "[fill] next" });
+  const system = sent("/api/v1/chat").at(-1).body.system_prompt;
+  assert.match(system, /^Earlier messages of this conversation:\n…/);
+  assert.ok(system.endsWith("END-OF-FIRST"));
+  assert.ok(system.length < 4200);
+  assert.match(next.meta().warning, /rebuilt from the saved transcript\. The context is getting full/);
+});
+
+test("session_compact works after the model was reloaded with a smaller context", async (t) => {
+  const c = session(t);
+  const { session_id } = (await c.call("session_start", { model: "tiny-llm", context_length: 8192 })).json();
+  await c.call("session_send", { session_id, message: "first" });
+  await c.call("load_model", { model: "tiny-llm", context_length: 4096, replace: true });
+  const compacted = await c.call("session_compact", { session_id });
+  assert.equal(compacted.isError, false);
+  assert.equal(compacted.json().summary, "SUMMARY: we talked.");
+  const send = await c.call("session_send", { session_id, message: "more" });
+  assert.match(send.text, /loaded with a 4096-token context, but 8192 tokens are needed.*reload: true/);
+});
+
 test("session_start reloads a model with a smaller context only when asked", async (t) => {
   const c = session(t);
   await c.call("load_model", { model: "tiny-llm" }); // 4096 tokens
@@ -866,6 +918,21 @@ test("broken session files don't break the session list", async (t) => {
   writeFileSync(join(c.home, "sessions", "s_junk.json"), "not json");
   assert.deepEqual((await c.call("session_get")).json().map((s) => [s.session_id, s.exchanges]), [["s_bad1", 0]]);
   assert.equal((await c.call("session_get", { session_id: "s_bad1" })).json().turns_total, 0);
+});
+
+test("old tasks are pruned, also those cut short by a crash", async (t) => {
+  const c = session(t);
+  mkdirSync(join(c.home, "tasks"), { recursive: true });
+  const old = new Date(Date.now() - 15 * 24 * 3600_000).toISOString();
+  const recent = new Date(Date.now() - 3600_000).toISOString();
+  const write = (id, fields) => writeFileSync(join(c.home, "tasks", `${id}.json`), JSON.stringify({ id, session_id: "s_x", prompt: "p", pid: 99999999, ...fields }));
+  write("t_olddone", { status: "done", started_at: old, finished_at: old });
+  write("t_oldcrash", { status: "running", started_at: old });
+  write("t_recent", { status: "running", started_at: recent });
+  writeFileSync(join(c.home, "tasks", "t_oldcrash.cancel"), "x");
+  const task = (await c.call("task_start", { model: "tiny-llm", prompt: "new job" })).json();
+  await c.call("task_status", { task_id: task.task_id, wait_seconds: 10 });
+  assert.deepEqual(readdirSync(join(c.home, "tasks")).sort(), [`${task.task_id}.json`, "t_recent.json"].sort());
 });
 
 test("a task whose process is gone shows as interrupted", async (t) => {

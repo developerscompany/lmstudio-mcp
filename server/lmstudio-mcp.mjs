@@ -2,7 +2,7 @@
 // LM Studio MCP server: lets Claude Code (or any MCP client) run a local LM Studio. It controls the API
 // server, models (list, estimate, load, unload, download, per-model defaults), sessions with context
 // control, background tasks, one-off chat and embeddings.
-// No dependencies: needs only Node.js 18+. Talks to LM Studio's REST API v1 and its `lms` CLI.
+// No dependencies: needs only Node.js 20+. Talks to LM Studio's REST API v1 and its `lms` CLI.
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -13,7 +13,7 @@ import { homedir, totalmem } from "node:os";
 import { dirname, extname, isAbsolute, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const QUICK_MS = 30_000;
 const STREAM_IDLE_MS = 10 * 60_000; // give up on a streamed answer after 10 minutes without any event
@@ -52,7 +52,13 @@ Environment (all optional):
 const LOAD_TIMEOUT_MS = Math.min(Math.max(Math.trunc(Number(setting("LMSTUDIO_TIMEOUT_MS"))) || 20 * 60_000, 1000), 2 ** 31 - 1);
 const HOME = setting("LMSTUDIO_MCP_HOME") ?? join(homedir(), ".lmstudio-mcp");
 
-class UserError extends Error {}
+// An error to show to the caller as it is. Errors answered by LM Studio also carry `status` (HTTP) and `param`.
+class UserError extends Error {
+  constructor(message, details) {
+    super(message);
+    Object.assign(this, details);
+  }
+}
 
 function log(...parts) {
   console.error("[lmstudio-mcp]", ...parts);
@@ -90,11 +96,13 @@ function now() {
 
 function sleep(ms, signal) {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, Math.max(0, ms));
-    signal?.addEventListener("abort", () => {
+    const finish = () => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
       resolve();
-    }, { once: true });
+    };
+    const timer = setTimeout(finish, Math.max(0, ms));
+    signal?.addEventListener("abort", finish, { once: true });
   });
 }
 
@@ -340,11 +348,12 @@ function parseResponse(response, text, method, path) {
   const status = response.statusCode;
   if (status >= 200 && status < 300) return data;
   const problem = typeof data.error === "string" ? data.error : data.error?.message || text || response.statusMessage;
+  const details = { status, param: data.error?.param };
   if (status === 401 || status === 403) {
-    throw new UserError(`LM Studio refused the request (HTTP ${status}): ${problem}. If API authentication is on, set LM_API_TOKEN.`);
+    throw new UserError(`LM Studio refused the request (HTTP ${status}): ${problem}. If API authentication is on, set LM_API_TOKEN.`, details);
   }
   const kind = typeof data.error === "object" && data.error?.type ? ` ${data.error.type}` : "";
-  throw new UserError(`LM Studio ${method} ${path} failed (HTTP ${status}${kind}): ${problem}`);
+  throw new UserError(`LM Studio ${method} ${path} failed (HTTP ${status}${kind}): ${problem}`, details);
 }
 
 async function readBody(response) {
@@ -487,9 +496,6 @@ async function loadModel(args, signal) {
       report: compact({ status: r.status, instance_id: r.instance_id, type: r.type, load_time_seconds: r.load_time_seconds, config: r.load_config, defaults_used: defaultsUsed }),
     };
   }
-  if (!isLocal(server.url)) {
-    throw new UserError(`load_model with ${lmsKeys.join(", ")} needs LM Studio on this machine (it uses the lms CLI), but LMSTUDIO_BASE_URL points to ${server.url}.`);
-  }
   await assertExactKey(settings.model, server, signal);
   const { stderr } = await runLms(["load", settings.model, "-y", ...lmsLoadFlags(settings)], { timeoutMs: LOAD_TIMEOUT_MS, signal });
   const extra = await lmsLoaded();
@@ -530,10 +536,18 @@ async function withModelLock(model, fn) {
 // Unloading a model while a session request or task uses it would cut that answer off.
 function assertModelIdle(model, exceptSessionId) {
   const key = modelKey(model);
-  for (const session of listJson("sessions", SESSION_ID)) {
-    if (session.id === exceptSessionId || modelKey(String(session.model ?? "")) !== key) continue;
-    const lock = readLock(session.id);
-    if (lock) throw new UserError(`${model} is in use by ${lock.task_id ? `task ${lock.task_id}` : `session ${session.id}`}. Wait for it or cancel it first.`);
+  let names = [];
+  try {
+    names = readdirSync(join(HOME, "sessions"));
+  } catch {
+    return; // no sessions yet
+  }
+  // Only sessions with a lock file can be in use, so only those are read.
+  for (const id of names.filter((name) => name.endsWith(".lock")).map((name) => name.slice(0, -5))) {
+    if (id === exceptSessionId || !SESSION_ID.test(id)) continue;
+    const lock = readLock(id);
+    if (!lock || modelKey(String(readJson(sessionPath(id), {})?.model ?? "")) !== key) continue;
+    throw new UserError(`${model} is in use by ${lock.task_id ? `task ${lock.task_id}` : `session ${id}`}. Wait for it or cancel it first.`);
   }
 }
 
@@ -629,6 +643,10 @@ function contextWarning(context) {
   return context?.percent >= CONTEXT_WARNING_PERCENT ? "The context is getting full: run session_compact or start a new session." : undefined;
 }
 
+function allWarnings(warning, context) {
+  return [warning, contextWarning(context)].filter(Boolean).join(" ") || undefined;
+}
+
 const STAT_KEYS = ["input_tokens", "total_output_tokens", "reasoning_output_tokens", "tokens_per_second", "time_to_first_token_seconds", "model_load_time_seconds"];
 
 // ---------- sessions ----------
@@ -649,18 +667,25 @@ function loadSession(id) {
 const LOCK_STALE_MS = 30_000;
 const heldLocks = new Map(); // session id -> heartbeat timer
 
-function readLock(id) {
+// Who holds the session's lock (`holder`, null when nobody does) and, for a lock file nobody holds any
+// more, the identity of that leftover file.
+function inspectLock(id) {
   let info;
   try {
     info = statSync(lockPath(id));
   } catch {
-    return null;
+    return { holder: null };
   }
   const lock = readJson(lockPath(id), {});
   const age = Date.now() - info.mtimeMs;
-  if (!Number.isInteger(lock.pid)) return age < 2000 ? lock : null; // being written right now
-  const held = lock.pid === process.pid ? heldLocks.has(id) : isAlive(lock.pid) && age < LOCK_STALE_MS;
-  return held ? lock : null;
+  let held;
+  if (!Number.isInteger(lock.pid)) held = age < 2000; // being written right now
+  else held = lock.pid === process.pid ? heldLocks.has(id) : isAlive(lock.pid) && age < LOCK_STALE_MS;
+  return held ? { holder: lock } : { holder: null, leftover: info };
+}
+
+function readLock(id) {
+  return inspectLock(id).holder;
 }
 
 function isBusy(id) {
@@ -669,7 +694,7 @@ function isBusy(id) {
 
 // Takes the session's lock or explains who holds it. Returns the function that releases it.
 function lockSession(id, holder = {}) {
-  const current = readLock(id);
+  const { holder: current, leftover } = inspectLock(id);
   if (current) {
     throw new UserError(
       current.task_id
@@ -678,7 +703,15 @@ function lockSession(id, holder = {}) {
     );
   }
   mkdirSync(join(HOME, "sessions"), { recursive: true, mode: 0o700 });
-  rmSync(lockPath(id), { force: true }); // a stale lock, if any
+  if (leftover) {
+    // Remove the leftover only while it is still that same file: another process may have taken the lock meanwhile.
+    try {
+      const info = statSync(lockPath(id));
+      if (info.ino === leftover.ino && info.mtimeMs === leftover.mtimeMs) rmSync(lockPath(id), { force: true });
+    } catch {
+      // already gone
+    }
+  }
   let fd;
   try {
     fd = openSync(lockPath(id), "wx", 0o600);
@@ -739,7 +772,10 @@ function recentTranscript(session, budget) {
   for (const turn of [...session.turns].reverse()) {
     if (turn.role === "system") break; // compaction marker
     const line = `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content ?? ""}`;
-    if (used + line.length > budget) break;
+    if (used + line.length > budget) {
+      if (!lines.length) lines.unshift(tail(line, budget)); // the newest turn alone is too long: keep its end
+      break;
+    }
     lines.unshift(line);
     used += line.length;
   }
@@ -757,9 +793,10 @@ function chainStart(session, limit) {
   );
 }
 
-// LM Studio answers 4xx when it no longer knows a previous_response_id, e.g. after it was restarted.
+// LM Studio answers HTTP 400 with param "previous_response_id" when it no longer has that response;
+// it deletes stored responses after 30 days.
 function isLostChain(error) {
-  return error instanceof UserError && /HTTP 4\d\d/.test(error.message) && /previous|response/i.test(error.message);
+  return error instanceof UserError && error.status >= 400 && error.status < 500 && error.param === "previous_response_id";
 }
 
 // One exchange in a session. LM Studio keeps the history (store + previous_response_id), so only the new
@@ -805,7 +842,7 @@ function turnReport(session, turn, includeReasoning) {
   const parts = [turn.answer || "(empty answer)"];
   if (includeReasoning && turn.reasoning) parts.push(`--- reasoning ---\n${turn.reasoning}`);
   if (turn.tool_calls?.length) parts.push(`--- tool calls by the local model ---\n${JSON.stringify(turn.tool_calls)}`);
-  const meta = compact({ session_id: session.id, context: formatContext(turn.context), warning: turn.warning ?? contextWarning(turn.context), stats: turn.stats });
+  const meta = compact({ session_id: session.id, context: formatContext(turn.context), warning: allWarnings(turn.warning, turn.context), stats: turn.stats });
   parts.push(`--- session ---\n${JSON.stringify(meta)}`);
   return parts.join("\n\n");
 }
@@ -857,11 +894,13 @@ function persistTask(task) {
 function pruneTasks() {
   try {
     const cutoff = Date.now() - 14 * 24 * 3600_000;
-    listJson("tasks", TASK_ID)
+    listTasks() // through taskView, so tasks cut short by a crash count as finished too
       .filter((t) => t.status !== "running")
       .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)))
       .forEach((t, index) => {
-        if (index >= 200 || Date.parse(t.finished_at ?? t.started_at) < cutoff) rmSync(taskPath(t.id), { force: true });
+        if (index < 200 && Date.parse(t.finished_at ?? t.started_at) >= cutoff) return;
+        rmSync(taskPath(t.id), { force: true });
+        rmSync(cancelPath(t.id), { force: true });
       });
   } catch (error) {
     log(`could not prune old tasks: ${error.message}`);
@@ -926,7 +965,7 @@ function taskReport(task) {
     return compact({ ...head, progress: compact({ phase: p.phase, percent: p.percent, tool_calls: p.tool_calls, answer_so_far: tail(p.partial, 1000) }) });
   }
   if (task.status !== "done") return compact({ ...head, answer_so_far: tail(task.progress?.partial, 1000) });
-  const meta = compact({ ...head, context: formatContext(task.context), warning: task.warning ?? contextWarning(task.context), tool_calls: task.tool_calls, stats: task.stats });
+  const meta = compact({ ...head, context: formatContext(task.context), warning: allWarnings(task.warning, task.context), tool_calls: task.tool_calls, stats: task.stats });
   return `${task.answer || "(empty answer)"}\n\n--- task ---\n${JSON.stringify(meta)}`;
 }
 
@@ -938,8 +977,8 @@ const S = {
   ttl: { type: "integer", minimum: 1, description: "Unload automatically after this many idle seconds." },
   gpu: { type: "string", pattern: GPU_PATTERN, description: 'GPU offload: "off", "max" or a ratio such as "0.5".' },
   parallel: { type: "integer", minimum: 1, description: "How many predictions may run at the same time." },
-  session_id: { type: "string", pattern: "^s_[a-z0-9]+$", description: "Session id from session_start or session_get." },
-  task_id: { type: "string", pattern: "^t_[a-z0-9]+$", description: "Task id from task_start or task_status." },
+  session_id: { type: "string", pattern: SESSION_ID.source, description: "Session id from session_start or session_get." },
+  task_id: { type: "string", pattern: TASK_ID.source, description: "Task id from task_start or task_status." },
   images: { type: "array", items: { type: "string" }, description: "Absolute paths to PNG, JPEG, WebP or GIF files, for vision models." },
   system_prompt: { type: "string", description: "System instructions." },
   temperature: { type: "number", minimum: 0, maximum: 1, description: "0 is deterministic." },
@@ -1355,7 +1394,7 @@ const TOOLS = [
       try {
         const session = loadSession(session_id);
         if (!session.last_response_id) return "Nothing to compact: the current context of this session is still empty.";
-        const instance = await ensureLoaded(session.model, { context_length: session.context_length, strict: true, session_id }, signal);
+        const instance = await ensureLoaded(session.model, { context_length: session.context_length }, signal);
         const state = {};
         const onEvent = (event) => trackEvent(state, event) && progress(progressLine(state));
         const prompt = instructions ? `${COMPACT_PROMPT}\n\nAlso keep: ${instructions}` : COMPACT_PROMPT;
@@ -1672,7 +1711,7 @@ async function callTool(id, params) {
 }
 
 async function handle(message) {
-  if (Array.isArray(message)) return message.forEach(handle); // JSON-RPC batch (protocol 2025-03-26)
+  if (Array.isArray(message)) return message.forEach((item) => handle(item).catch((error) => log(error?.stack ?? error))); // JSON-RPC batch (protocol 2025-03-26)
   const { id, method, params } = message ?? {};
   const isRequest = id !== undefined && id !== null;
   if (typeof method !== "string") {

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.1 (2026-11-11)
+
+Fixes from an audit of 0.1.0.
+
+- A lost conversation is recognised by the error field LM Studio sends (`param: previous_response_id`), not by the wording of its message. Checked against LM Studio, which deletes stored responses after 30 days.
+- A rebuilt conversation keeps the end of a very long last turn instead of dropping all history.
+- The "context is getting full" warning is no longer hidden by another warning.
+- `session_compact` works when the model was reloaded with a smaller context.
+- Taking over a leftover session lock no longer removes a lock that another process has just taken.
+- Tasks that a crash left as running are pruned like other old tasks, together with their cancel files.
+- `task_status` no longer piles up listeners while it waits.
+- The Node.js requirement is now 20+: the tests run on 20, 22, 24 and 26.
+
 ## 0.1.0 (2026-11-11)
 
 First release.
@@ -10,4 +23,4 @@ First release.
 - Safe for parallel use: one load per model at a time, session locks shared between Claude Code sessions, task heartbeats and cancel requests across processes, no unload of a model in use. Sessions recover from the saved transcript when LM Studio lost a conversation.
 - Claude Code plugin and marketplace in one repository, with optional settings for the LM Studio URL and API token.
 - Finds the LM Studio port with `lms server status` and falls back to 1234.
-- No dependencies; Node.js 18+.
+- No dependencies.
