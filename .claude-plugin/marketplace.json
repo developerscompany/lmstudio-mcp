@@ -1,0 +1,21 @@
+{
+  "name": "lmstudio-mcp",
+  "owner": {
+    "name": "Rivo Agency",
+    "url": "https://github.com/developerscompany"
+  },
+  "description": "LM Studio tools for Claude Code.",
+  "plugins": [
+    {
+      "name": "lmstudio",
+      "source": "./",
+      "description": "Manage LM Studio from Claude Code: server, models and context, sessions, background tasks, downloads, chat and embeddings.",
+      "category": "development",
+      "tags": [
+        "lmstudio",
+        "local-llm",
+        "mcp"
+      ]
+    }
+  ]
+}

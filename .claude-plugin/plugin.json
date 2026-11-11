@@ -1,0 +1,46 @@
+{
+  "name": "lmstudio",
+  "version": "0.1.0",
+  "description": "Manage LM Studio from Claude Code: server, models with per-model context settings, sessions with context control, background tasks, downloads, chat and embeddings.",
+  "author": {
+    "name": "Rivo Agency",
+    "url": "https://github.com/developerscompany"
+  },
+  "homepage": "https://github.com/developerscompany/lmstudio-mcp",
+  "repository": "https://github.com/developerscompany/lmstudio-mcp",
+  "license": "MIT",
+  "keywords": [
+    "lmstudio",
+    "lm-studio",
+    "local-llm",
+    "mcp",
+    "models"
+  ],
+  "userConfig": {
+    "base_url": {
+      "type": "string",
+      "title": "LM Studio URL",
+      "description": "Leave empty for LM Studio on this computer: the port is detected automatically. Set it for LM Studio on another machine, e.g. http://192.168.1.20:1234.",
+      "required": false
+    },
+    "api_token": {
+      "type": "string",
+      "title": "LM Studio API token",
+      "description": "Only needed if API authentication is turned on in LM Studio.",
+      "required": false,
+      "sensitive": true
+    }
+  },
+  "mcpServers": {
+    "lmstudio": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server/lmstudio-mcp.mjs"
+      ],
+      "env": {
+        "LMSTUDIO_BASE_URL": "${user_config.base_url}",
+        "LM_API_TOKEN": "${user_config.api_token}"
+      }
+    }
+  }
+}

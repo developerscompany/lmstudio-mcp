@@ -1,0 +1,42 @@
+{
+  "name": "lmstudio-mcp",
+  "version": "0.1.0",
+  "description": "MCP server and Claude Code plugin for LM Studio: server, models and context length, sessions, background tasks, downloads, chat and embeddings. No dependencies.",
+  "type": "module",
+  "bin": {
+    "lmstudio-mcp": "server/lmstudio-mcp.mjs"
+  },
+  "files": [
+    "server/",
+    ".claude-plugin/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node server/lmstudio-mcp.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "lmstudio",
+    "lm-studio",
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "claude-code-plugin",
+    "local-llm"
+  ],
+  "license": "MIT",
+  "author": "Rivo Agency (https://github.com/developerscompany)",
+  "homepage": "https://github.com/developerscompany/lmstudio-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/developerscompany/lmstudio-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/developerscompany/lmstudio-mcp/issues"
+  }
+}
