@@ -15,11 +15,12 @@ import { dirname, extname, isAbsolute, join } from "node:path";
 import { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const QUICK_MS = 30_000;
 const STREAM_IDLE_MS = 10 * 60_000; // give up on a streamed answer after 10 minutes without any event
 const MAX_IMAGE_BYTES = 20_000_000;
+const MAX_FILE_BYTES = 2_000_000; // per attached text file
 const CONTEXT_WARNING_PERCENT = 80;
 const IMAGE_TYPES = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" };
 const GPU_PATTERN = "^(off|max|0(\\.\\d+)?|1(\\.0+)?)$";
@@ -39,6 +40,7 @@ const INSTRUCTIONS = `Tools for the user's LM Studio: server control, models, se
 - Sessions are conversations kept in LM Studio: session_start (model, optional system_prompt and context_length), then session_send. Every answer shows how full the context is; past ${CONTEXT_WARNING_PERCENT}% run session_compact or start a new session. session_get lists the sessions or shows one.
 - Tasks run a session turn in the background: task_start returns a task_id at once; follow it with task_status (wait_seconds waits for the result) and stop it with task_cancel. Use tasks for long jobs so you can keep working meanwhile. Tasks stop when this Claude Code session ends.
 - chat is a one-off prompt without history. chat, sessions and tasks load the model when needed.
+- To give the local model code, logs or documents, pass their paths in files (chat, session_send, task_start) instead of pasting the text: the files are read from disk and added to the message.
 - Unload the models you loaded once the work is done, unless the user wants them kept. Check local answers before relying on them.`;
 
 const HELP = `lmstudio-mcp ${VERSION}: MCP server (stdio) for LM Studio.
@@ -452,6 +454,11 @@ function parseResponse(response, text, method, path) {
   if (status >= 200 && status < 300) return data;
   const problem = typeof data.error === "string" ? data.error : data.error?.message || text || response.statusMessage;
   const details = { status, param: data.error?.param };
+  const overflow = /request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)/.exec(problem);
+  if (overflow) {
+    const [needed, context] = overflow.slice(1).map((count) => Number(count).toLocaleString("en-US"));
+    throw new UserError(`The request needs ${needed} tokens, but the model is loaded with a ${context}-token context. Send less, run session_compact, or load the model with a larger context.`, details);
+  }
   if (status === 401 || status === 403) {
     throw new UserError(`LM Studio refused the request (HTTP ${status}): ${problem}. If API authentication is on, set LM_API_TOKEN.`, details);
   }
@@ -491,6 +498,7 @@ async function chatStream(body, { signal, onEvent } = {}) {
     let buffer = "";
     let result;
     let failure;
+    let started = false; // the model has begun to answer
     const handle = (block) => {
       const data = block
         .split(/\r?\n/)
@@ -506,6 +514,7 @@ async function chatStream(body, { signal, onEvent } = {}) {
       }
       if (event.type === "chat.end") result = event.result;
       else if (event.type === "error") failure = event.error;
+      else if (/^(reasoning|message|tool_call)\./.test(event.type)) started = true;
       onEvent?.(event);
     };
     for await (const chunk of response) {
@@ -520,6 +529,9 @@ async function chatStream(body, { signal, onEvent } = {}) {
     if (buffer.trim()) handle(buffer);
     const answered = (result?.output ?? []).some((item) => item.type === "message" && item.content);
     if (failure && !answered) throw new UserError(`LM Studio could not answer (${failure.type}): ${failure.message}`);
+    // When LM Studio can't start an answer (the request is larger than the context, for one), it ends the
+    // stream without a word. The same request without streaming says why.
+    if (!result && !failure && !started) return await api("POST", path, body, { signal, timeoutMs: STREAM_IDLE_MS });
     if (!result) throw new UserError("LM Studio closed the stream without a final result.");
     return failure ? { ...result, warning: `LM Studio reported an error during the answer (${failure.type}): ${failure.message}` } : result;
   } catch (error) {
@@ -557,9 +569,30 @@ function imageDataUrl(path) {
   return `data:${type};base64,${readFileSync(path).toString("base64")}`;
 }
 
-function buildInput(text, images) {
-  if (!images?.length) return text;
-  return [{ type: "text", content: text }, ...images.map((path) => ({ type: "image", data_url: imageDataUrl(path) }))];
+// Text files attached to a message are read here and added to it, so the caller doesn't have to paste them.
+function attachFiles(text, files) {
+  const parts = [text];
+  for (const path of files ?? []) {
+    if (!isAbsolute(path)) throw new UserError(`Use an absolute path for files: ${path}`);
+    let info;
+    try {
+      info = statSync(path);
+    } catch {
+      throw new UserError(`File not found: ${path}`);
+    }
+    if (!info.isFile()) throw new UserError(`Not a file: ${path}`);
+    if (info.size > MAX_FILE_BYTES) throw new UserError(`File is larger than 2 MB: ${path}`);
+    const content = readFileSync(path);
+    if (content.includes(0)) throw new UserError(`Not a text file: ${path}`);
+    parts.push(`--- file: ${path} ---\n${content.toString("utf8")}\n--- end of file ---`);
+  }
+  return parts.join("\n\n");
+}
+
+function buildInput(text, images, files) {
+  const message = attachFiles(text, files);
+  if (!images?.length) return message;
+  return [{ type: "text", content: message }, ...images.map((path) => ({ type: "image", data_url: imageDataUrl(path) }))];
 }
 
 function cosine(a, b) {
@@ -874,7 +907,8 @@ function recentTranscript(session, budget) {
   let used = 0;
   for (const turn of [...session.turns].reverse()) {
     if (turn.role === "system") break; // compaction marker
-    const line = `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content ?? ""}`;
+    const attached = turn.files?.length ? `\n[attached files, not repeated here: ${turn.files.join(", ")}]` : "";
+    const line = `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content ?? ""}${attached}`;
     if (used + line.length > budget) {
       if (!lines.length) lines.unshift(tail(line, budget)); // the newest turn alone is too long: keep its end
       break;
@@ -905,8 +939,8 @@ function isLostChain(error) {
 // One exchange in a session. LM Studio keeps the history (store + previous_response_id), so only the new
 // message is sent. A new chain (first message, after session_compact, or when LM Studio lost the
 // conversation) starts with chainStart().
-async function runTurn(session, { message, images, max_output_tokens, reload }, { signal, onEvent } = {}) {
-  const input = buildInput(message, images);
+async function runTurn(session, { message, images, files, max_output_tokens, reload }, { signal, onEvent } = {}) {
+  const input = buildInput(message, images, files);
   const instance = await ensureLoaded(session.model, { context_length: session.context_length, strict: true, reload, session_id: session.id }, signal);
   const body = compact({
     model: instance.instance_id,
@@ -933,7 +967,7 @@ async function runTurn(session, { message, images, max_output_tokens, reload }, 
   session.instance_id = instance.instance_id;
   session.last_response_id = result.response_id ?? null;
   session.context = contextUsage(result.stats, instance.context_length);
-  session.turns.push(compact({ role: "user", content: message, images: images?.length, at: now() }));
+  session.turns.push(compact({ role: "user", content: message, images: images?.length, files, at: now() })); // files by path only
   session.turns.push(compact({ role: "assistant", content: output.answer, tool_calls: output.tool_calls, stats, at: now() }));
   session.updated_at = now();
   saveSession(session);
@@ -1010,7 +1044,7 @@ function pruneTasks() {
   }
 }
 
-function startTask(sessionId, { prompt, images, max_output_tokens, reload }) {
+function startTask(sessionId, { prompt, images, files, max_output_tokens, reload }) {
   const task = { id: newId("t"), session_id: sessionId, prompt, status: "running", pid: process.pid, started_at: now(), progress: { phase: "starting" } };
   const release = lockSession(sessionId, { task_id: task.id });
   let session;
@@ -1033,7 +1067,7 @@ function startTask(sessionId, { prompt, images, max_output_tokens, reload }) {
       log(`could not save task ${task.id}: ${error.message}`);
     }
   }, 2000);
-  const done = runTurn(session, { message: prompt, images, max_output_tokens, reload }, { signal: controller.signal, onEvent: (event) => trackEvent(task.progress, event) })
+  const done = runTurn(session, { message: prompt, images, files, max_output_tokens, reload }, { signal: controller.signal, onEvent: (event) => trackEvent(task.progress, event) })
     .then((turn) => Object.assign(task, { status: "done", answer: turn.answer, reasoning: turn.reasoning || undefined, tool_calls: turn.tool_calls, stats: turn.stats, context: turn.context, warning: turn.warning }))
     .catch((error) => Object.assign(task, { status: controller.signal.aborted ? "cancelled" : "failed", error: error.message }))
     .finally(() => {
@@ -1083,6 +1117,7 @@ const S = {
   session_id: { type: "string", pattern: SESSION_ID.source, description: "Session id from session_start or session_get." },
   task_id: { type: "string", pattern: TASK_ID.source, description: "Task id from task_start or task_status." },
   images: { type: "array", items: { type: "string" }, description: "Absolute paths to PNG, JPEG, WebP or GIF files, for vision models." },
+  files: { type: "array", items: { type: "string" }, description: "Absolute paths to text files (code, logs, documents) to add to the message, up to 2 MB each. Use this instead of pasting file contents." },
   system_prompt: { type: "string", description: "System instructions." },
   temperature: { type: "number", minimum: 0, maximum: 1, description: "0 is deterministic." },
   max_output_tokens: { type: "integer", minimum: 1, description: "Upper limit for generated tokens per answer." },
@@ -1414,7 +1449,7 @@ const TOOLS = [
   {
     name: "session_send",
     title: "LM Studio: send to a session",
-    description: "Send a message in a session and wait for the answer. Reports how full the context is. For long jobs use task_start instead.",
+    description: "Send a message in a session, with optional text files and images, and wait for the answer. Reports how full the context is. For long jobs use task_start instead.",
     inputSchema: {
       type: "object",
       required: ["session_id", "message"],
@@ -1422,6 +1457,7 @@ const TOOLS = [
         session_id: S.session_id,
         message: { type: "string", description: "The message to send." },
         images: S.images,
+        files: S.files,
         max_output_tokens: S.max_output_tokens,
         include_reasoning: S.include_reasoning,
         reload: S.reload,
@@ -1571,7 +1607,7 @@ const TOOLS = [
     name: "task_start",
     title: "LM Studio: start a background task",
     description:
-      "Run a prompt on a local model in the background and return a task_id at once. Pass session_id to continue a session, or model " +
+      "Run a prompt, with optional text files and images, on a local model in the background and return a task_id at once. Pass session_id to continue a session, or model " +
       "(plus optional session settings) to start a new session for the task. Follow it with task_status; stop it with task_cancel.",
     inputSchema: {
       type: "object",
@@ -1589,6 +1625,7 @@ const TOOLS = [
         reasoning: S.reasoning,
         integrations: S.integrations,
         images: S.images,
+        files: S.files,
       },
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -1597,13 +1634,14 @@ const TOOLS = [
       if (args.session_id && args.model) throw new UserError("Pass session_id or model, not both.");
       if (args.session_id && newSessionOnly.length) throw new UserError(`${newSessionOnly.join(", ")} only apply to a new session; leave them out with session_id.`);
       if (!args.session_id && !args.model) throw new UserError("Pass session_id to continue a session, or model to start a new one.");
-      for (const path of args.images ?? []) imageDataUrl(path); // fail now rather than in the background
+      buildInput(args.prompt, args.images, args.files); // unreadable files fail now rather than in the background
       const session = args.session_id
         ? loadSession(args.session_id)
         : (await createSession({ ...pick(args, SESSION_KEYS), title: args.title ?? clip(args.prompt, 60) }, signal, { load: false })).session;
       const task = startTask(session.id, {
         prompt: args.prompt,
         images: args.images,
+        files: args.files,
         max_output_tokens: args.session_id ? args.max_output_tokens : undefined, // a new session keeps it as its own setting
         reload: args.reload,
       });
@@ -1667,7 +1705,7 @@ const TOOLS = [
     name: "chat",
     title: "LM Studio: one-off prompt",
     description:
-      "Send a single prompt (and optional images) to a local model and get its answer with speed stats; nothing is remembered. " +
+      "Send a single prompt (with optional text files and images) to a local model and get its answer with speed stats; nothing is remembered. " +
       "Loads the model if needed. For conversations use sessions, for long jobs task_start.",
     inputSchema: {
       type: "object",
@@ -1677,6 +1715,7 @@ const TOOLS = [
         prompt: { type: "string", description: "The user message." },
         system_prompt: S.system_prompt,
         images: S.images,
+        files: S.files,
         temperature: S.temperature,
         max_output_tokens: S.max_output_tokens,
         reasoning: S.reasoning,
@@ -1688,7 +1727,7 @@ const TOOLS = [
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async run(args, { signal, progress }) {
-      const input = buildInput(args.prompt, args.images);
+      const input = buildInput(args.prompt, args.images, args.files);
       const instance = await ensureLoaded(args.model, { context_length: args.context_length, strict: args.context_length !== undefined, reload: args.reload }, signal);
       const state = {};
       const result = await chatStream(

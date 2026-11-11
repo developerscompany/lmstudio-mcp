@@ -12,6 +12,7 @@ It is a Claude Code plugin with one small MCP server: a single file with no depe
 - "Always load qwen3.8 with a 256k context."
 - "Will gpt-oss-120b fit in memory with a 64k context?"
 - "Start a session with the local model as a code reviewer, then send it these files one by one."
+- "Give the local model `src/api.ts` and `docs/api.md` in the background and ask what the docs get wrong."
 - "Run this analysis on the local model in the background and tell me when it's done."
 - "How full is the context of that session? Compact it."
 - "Download granite-4-micro and tell me when it's done."
@@ -43,9 +44,9 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 | Models | `list_models`, `estimate_load`, `load_model`, `unload_model` | Downloaded and loaded models; memory needed before loading; load with context length, TTL, GPU offload, parallel slots, flash attention; unload one or all |
 | Context | `model_defaults` | Per-model load settings (context length, TTL, GPU, parallel) used by every load |
 | Downloads | `download_model`, `download_status` | Download from the LM Studio catalog or a Hugging Face URL and follow the progress |
-| Sessions | `session_start`, `session_send`, `session_get`, `session_compact`, `session_delete` | Conversations with a local model that keep their history, with context use after every answer |
-| Tasks | `task_start`, `task_status`, `task_cancel` | Run a prompt in the background, follow its progress, wait for the result or stop it |
-| One-off | `chat`, `embed` | A single prompt (optionally with images) without history; embeddings with a similarity matrix |
+| Sessions | `session_start`, `session_send`, `session_get`, `session_compact`, `session_delete` | Conversations with a local model that keep their history, with text files and images, and context use after every answer |
+| Tasks | `task_start`, `task_status`, `task_cancel` | Run a prompt (with text files and images) in the background, follow its progress, wait for the result or stop it |
+| One-off | `chat`, `embed` | A single prompt (optionally with text files and images) without history; embeddings with a similarity matrix |
 
 ## Sessions, context and tasks
 
@@ -54,6 +55,8 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 **Sessions.** `session_start` loads the model if needed and opens a conversation; `session_send` adds a message. LM Studio keeps the conversation on its side (`store` and `previous_response_id` of its chat API), so only the new message is sent each time. Every answer reports how full the context is, for example `45,210 / 262,144 tokens (17%)`, and warns from 80%. `session_compact` asks the model to summarize the conversation; the next message starts a fresh context that begins with that summary. A session handles one request at a time, also when several Claude Code sessions use it. LM Studio deletes stored conversations after 30 days; when it no longer has one, the next message rebuilds it from the saved transcript and says so. Sessions can give the local model LM Studio plugins or MCP servers configured in LM Studio through `integrations` (for example `"mcp/github"`); the tool calls it makes are shown with the answer.
 
 **Tasks.** `task_start` runs a message in a new or existing session in the background and returns a task id at once. `task_status` shows the phase (loading model, reading prompt with a percentage, thinking, calling a tool, answering), the answer so far and, when done, the full result; `wait_seconds` waits for it. `task_cancel` stops it. Tasks run inside the MCP server, so they stop when the Claude Code session that started them ends; they are then marked as interrupted. Other Claude Code sessions can see their status and cancel them. Finished tasks are kept for 14 days (at most 200).
+
+**Files.** `chat`, `session_send` and `task_start` take `files`: absolute paths to text files such as code, logs or documents, up to 2 MB each. The plugin reads them and adds them to the message, so Claude doesn't have to paste their contents. A session's saved transcript keeps the paths, not the contents. When a request doesn't fit the context, LM Studio refuses it and the plugin says how many tokens it needs.
 
 Long calls (`session_send`, `chat`, `session_compact`) send MCP progress notifications, so Claude Code shows what the model is doing.
 
@@ -106,7 +109,7 @@ Claude Desktop, Cursor and other clients:
 ```json
 {
   "mcpServers": {
-    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.2.0"] }
+    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.3.0"] }
   }
 }
 ```
@@ -117,7 +120,7 @@ Claude Desktop, Cursor and other clients:
 - `lms` runs with fixed arguments and never through a local shell; values that look like command-line flags are rejected, and loads through `lms` need an exact model key.
 - Over SSH, every argument is quoted for the shell of the other machine, and the SSH host must be a plain host name or alias, so it can't carry options.
 - `server_start` never opens the server to the network or turns on CORS; it ignores `LMS_SERVER_HOST` from the environment.
-- Images for `chat` and sessions must be absolute paths to image files under 20 MB.
+- Images and text files for `chat`, sessions and tasks must be absolute paths: images under 20 MB, text files under 2 MB. They are read on the computer where Claude Code runs and sent only to LM Studio.
 
 ## Development
 

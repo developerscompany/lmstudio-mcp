@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0 (2026-11-11)
+
+- `files` for `chat`, `session_send` and `task_start`: paths to text files that the plugin reads and adds to the message, so Claude doesn't have to paste code, logs or documents.
+- A request that is larger than the context is now explained with the numbers LM Studio gives ("needs 20,523 tokens, but the model is loaded with a 4,096-token context") instead of "closed the stream without a final result".
+
 ## 0.2.0 (2026-11-11)
 
 - LM Studio on another machine over SSH: with the new SSH host setting (`LMSTUDIO_SSH_HOST`) the plugin runs `lms` on that machine and sends API requests through `ssh -W`. Nothing is opened on the network and every tool works, including `server_start`, `estimate_load` and loads with TTL.

@@ -106,7 +106,8 @@ const routes = {
 
 // POST /api/v1/chat: answers "Answer <n> to: <text>", where n counts the turns of the conversation.
 // "[slow]" / "[very slow]" in the text slow the stream down, "[fill]" reports 85% of the context as used,
-// "[error]" fails during the answer and "[bad request]" is refused with HTTP 400.
+// "[error]" fails during the answer, "[bad request]" is refused with HTTP 400 and "[too long]" behaves like a
+// request that is larger than the context: a stream that ends at once, or HTTP 500 without streaming.
 async function chat(body, res) {
   const instance = loaded.get(body.model);
   if (!instance) return send(res, 404, { error: { type: "model_not_found", message: `Model ${body.model} is not loaded` } });
@@ -116,6 +117,14 @@ async function chat(body, res) {
   }
   const depth = (chains.get(body.previous_response_id) ?? 0) + 1;
   const text = typeof body.input === "string" ? body.input : body.input.find((item) => item.type === "text").content;
+  if (text.includes("[too long]")) {
+    if (body.stream) {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      return res.end(`event: chat.start\ndata: ${JSON.stringify({ type: "chat.start", model_instance_id: body.model })}\n\n`);
+    }
+    const engine = { error: { code: 400, message: "request (20523 tokens) exceeds the available context size (4096 tokens), try increasing it", type: "exceed_context_size_error" } };
+    return send(res, 500, { error: { message: `Engine protocol predict request returned 400: ${JSON.stringify(engine)}`, type: "internal_error", code: "unknown", param: null } });
+  }
   if (text.includes("[bad request]")) return send(res, 400, { error: { message: "Invalid response format", type: "invalid_request", param: "input" } });
   const answer = text.startsWith("Summarize our conversation") ? "SUMMARY: we talked." : `Answer ${depth} to: ${text}`;
   const toolCall = { tool: "search", arguments: { q: "x" }, output: "found", provider_info: { type: "plugin", plugin_id: body.integrations?.[0] } };
@@ -763,6 +772,58 @@ test("chat attaches images, shows tool calls and reports stream errors", async (
   const failed = await c.call("chat", { model: "tiny-llm", prompt: "[error]" });
   assert.equal(failed.isError, true);
   assert.match(failed.text, /could not answer \(internal_error\): boom/);
+});
+
+test("text files are read from disk and added to the message", async (t) => {
+  const c = session(t);
+  const notes = join(work, "notes.md");
+  const code = join(work, "code.js");
+  writeFileSync(notes, "# Notes\nfirst line\n");
+  writeFileSync(code, "export const x = 1;\n");
+  await c.call("chat", { model: "tiny-llm", prompt: "Review these", files: [notes, code] });
+  assert.equal(
+    sent("/api/v1/chat").at(-1).body.input,
+    `Review these\n\n--- file: ${notes} ---\n# Notes\nfirst line\n\n--- end of file ---\n\n--- file: ${code} ---\nexport const x = 1;\n\n--- end of file ---`,
+  );
+
+  // In a session the transcript keeps the paths, not the contents.
+  const { session_id } = (await c.call("session_start", { model: "tiny-llm" })).json();
+  await c.call("session_send", { session_id, message: "Summarize", files: [notes] });
+  assert.match(sent("/api/v1/chat").at(-1).body.input, /^Summarize\n\n--- file: .*notes\.md ---\n# Notes/);
+  const turn = (await c.call("session_get", { session_id })).json().turns[0];
+  assert.equal(turn.content, "Summarize");
+  assert.deepEqual(turn.files, [notes]);
+  await fetch(`http://127.0.0.1:${port}/__forget`, { method: "POST" });
+  await c.call("session_send", { session_id, message: "And now?" });
+  assert.match(sent("/api/v1/chat").at(-1).body.system_prompt, new RegExp(`User: Summarize\\n\\[attached files, not repeated here: .*notes\\.md\\]`));
+
+  const task = (await c.call("task_start", { session_id, prompt: "Check the code", files: [code] })).json();
+  assert.match((await c.call("task_status", { task_id: task.task_id, wait_seconds: 10 })).text, /^Answer 2 to: Check the code\n\n--- file: .*code\.js ---/);
+});
+
+test("files that can't be attached are refused before anything is sent", async (t) => {
+  const c = session(t);
+  const binary = join(work, "data.bin");
+  const big = join(work, "big.txt");
+  writeFileSync(binary, Buffer.from([1, 2, 0, 3]));
+  writeFileSync(big, "x".repeat(2_000_001));
+  const call = (files) => c.call("chat", { model: "tiny-llm", prompt: "x", files });
+  assert.match((await call(["relative.txt"])).text, /Use an absolute path for files/);
+  assert.match((await call([join(work, "missing.txt")])).text, /File not found/);
+  assert.match((await call([work])).text, /Not a file/);
+  assert.match((await call([binary])).text, /Not a text file/);
+  assert.match((await call([big])).text, /File is larger than 2 MB/);
+  assert.match((await c.call("task_start", { model: "tiny-llm", prompt: "x", files: [join(work, "missing.txt")] })).text, /File not found/);
+  assert.equal(sent("/api/v1/chat").length, 0);
+  assert.equal((await c.call("session_get")).text, "No sessions yet. Start one with session_start.");
+});
+
+test("a request that is larger than the context is explained", async (t) => {
+  const c = session(t);
+  const result = await c.call("chat", { model: "tiny-llm", prompt: "[too long] a huge prompt" });
+  assert.equal(result.isError, true);
+  assert.equal(result.text, "The request needs 20,523 tokens, but the model is loaded with a 4,096-token context. Send less, run session_compact, or load the model with a larger context.");
+  assert.deepEqual(sent("/api/v1/chat").map((r) => r.body.stream), [true, undefined]);
 });
 
 test("embed returns the cosine similarity matrix", async (t) => {
