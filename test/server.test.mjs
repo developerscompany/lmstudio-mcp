@@ -1,7 +1,7 @@
 // Runs the MCP server against a fake LM Studio (REST API with streaming) and a fake `lms` CLI. Run with: npm test
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -82,6 +82,10 @@ const routes = {
     return load(body);
   },
   "POST /__lms/load": (body) => load(body),
+  "POST /__forget": () => {
+    chains.clear(); // like LM Studio after a restart
+    return [200, {}];
+  },
   "GET /__lms/ps": () => [200, [...loaded].map(([id, v]) => ({ identifier: id, ttlMs: v.ttlMs, status: "idle" }))],
   "POST /api/v1/models/unload": (body) =>
     loaded.delete(body.instance_id)
@@ -97,7 +101,8 @@ const routes = {
 };
 
 // POST /api/v1/chat: answers "Answer <n> to: <text>", where n counts the turns of the conversation.
-// "[slow]" in the text slows the stream down, "[fill]" reports 85% of the context as used, "[error]" fails.
+// "[slow]" / "[very slow]" in the text slow the stream down, "[fill]" reports 85% of the context as used,
+// "[error]" fails.
 async function chat(body, res) {
   const instance = loaded.get(body.model);
   if (!instance) return send(res, 404, { error: { type: "model_not_found", message: `Model ${body.model} is not loaded` } });
@@ -133,10 +138,11 @@ async function chat(body, res) {
     ["chat.end", { result }],
   ];
   res.writeHead(200, { "Content-Type": "text/event-stream" });
+  const pause = text.includes("[very slow]") ? 1000 : text.includes("[slow]") ? 400 : 0;
   for (const [type, data] of events) {
     if (res.destroyed) return;
     res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
-    if (text.includes("[slow]")) await delay(400);
+    if (pause) await delay(pause);
   }
   res.end();
 }
@@ -508,6 +514,33 @@ test("load_model refuses to mix lms and REST options", async (t) => {
   const result = await c.call("load_model", { model: "tiny-llm", ttl: 60, flash_attention: true });
   assert.equal(result.isError, true);
   assert.match(result.text, /Can't combine ttl/);
+  assert.match((await c.call("load_model", { model: "tiny-llm", identifier: "x", replace: true })).text, /replace doesn't apply with identifier/);
+});
+
+test("parallel calls load a model only once", async (t) => {
+  const c = session(t);
+  const chats = await Promise.all([c.call("chat", { model: "tiny-llm", prompt: "one" }), c.call("chat", { model: "tiny-llm", prompt: "two" })]);
+  assert.deepEqual(chats.map((r) => r.isError), [false, false]);
+  assert.equal(sent("/api/v1/models/load").length, 1);
+
+  await c.call("unload_model", { all: true });
+  const tasks = await Promise.all([c.call("task_start", { model: "tiny-llm", prompt: "job one" }), c.call("task_start", { model: "tiny-llm", prompt: "job two" })]);
+  for (const task of tasks) assert.equal((await c.call("task_status", { task_id: task.json().task_id, wait_seconds: 10 })).meta().status, "done");
+  assert.equal(sent("/api/v1/models/load").length, 2);
+  assert.deepEqual([...loaded.keys()], ["tiny-llm"]);
+});
+
+test("a model used by a running task can't be replaced or unloaded", async (t) => {
+  const c = session(t);
+  const task = (await c.call("task_start", { model: "tiny-llm", prompt: "[slow] busy work" })).json();
+  await delay(600);
+  const replaced = await c.call("load_model", { model: "tiny-llm", replace: true });
+  assert.equal(replaced.isError, true);
+  assert.match(replaced.text, new RegExp(`in use by task ${task.task_id}`));
+  assert.equal((await c.call("unload_model", { all: true })).isError, true);
+  assert.equal(sent("/api/v1/models/unload").length, 0);
+  await c.call("task_status", { task_id: task.task_id, wait_seconds: 15 });
+  assert.deepEqual((await c.call("unload_model", { all: true })).json().unloaded.sort(), ["tiny-embed", "tiny-llm"]);
 });
 
 test("LM Studio errors come back as tool errors", async (t) => {
@@ -669,6 +702,33 @@ test("a full context triggers a warning and session_compact starts a fresh conte
   assert.equal(nextBody.system_prompt, "Be brief\n\nSummary of the conversation so far:\nSUMMARY: we talked.");
 });
 
+test("a session continues from its saved transcript when LM Studio lost the conversation", async (t) => {
+  const c = session(t);
+  const forget = () => fetch(`http://127.0.0.1:${port}/__forget`, { method: "POST" });
+  const { session_id } = (await c.call("session_start", { model: "tiny-llm", system_prompt: "Be brief" })).json();
+  await c.call("session_send", { session_id, message: "first" });
+  await forget();
+
+  const second = await c.call("session_send", { session_id, message: "second" });
+  assert.equal(second.isError, false);
+  assert.match(second.text, /^Answer 1 to: second/);
+  assert.match(second.meta().warning, /rebuilt from the saved transcript/);
+  const retry = sent("/api/v1/chat").at(-1).body;
+  assert.equal(retry.previous_response_id, undefined);
+  assert.equal(retry.system_prompt, "Be brief\n\nEarlier messages of this conversation:\nUser: first\n\nAssistant: Answer 1 to: first");
+
+  const third = await c.call("session_send", { session_id, message: "third" });
+  assert.match(third.text, /^Answer 2 to: third/);
+  assert.equal(third.meta().warning, undefined);
+
+  await forget();
+  const compacted = (await c.call("session_compact", { session_id })).json();
+  assert.equal(compacted.summary, "SUMMARY: we talked.");
+  const compactBody = sent("/api/v1/chat").at(-1).body;
+  assert.equal(compactBody.previous_response_id, undefined);
+  assert.match(compactBody.input, /\n\nConversation:\nUser: first\n\nAssistant: Answer 1 to: first/);
+});
+
 test("session_start reloads a model with a smaller context only when asked", async (t) => {
   const c = session(t);
   await c.call("load_model", { model: "tiny-llm" }); // 4096 tokens
@@ -744,6 +804,68 @@ test("task_start checks its arguments before starting", async (t) => {
   assert.match((await c.call("task_start", { prompt: "x", model: "tiny-llm", session_id: "s_abc" })).text, /not both/);
   assert.match((await c.call("task_start", { prompt: "x", session_id: "s_abc", system_prompt: "y" })).text, /only apply to a new session/);
   assert.match((await c.call("task_start", { prompt: "x", model: "tiny-llm", images: [join(work, "missing.png")] })).text, /Image not found/);
+});
+
+test("two Claude Code sessions share sessions and tasks safely", async (t) => {
+  const a = session(t);
+  const b = session(t, { LMSTUDIO_MCP_HOME: a.home });
+  const task = (await a.call("task_start", { model: "tiny-llm", prompt: "[very slow] shared job" })).json();
+  await delay(300);
+  assert.match((await b.call("session_send", { session_id: task.session_id, message: "hi" })).text, new RegExp(`busy with task ${task.task_id}`));
+  assert.match((await b.call("session_delete", { session_id: task.session_id })).text, /Busy sessions can't be deleted/);
+  assert.equal((await b.call("task_status", { task_id: task.task_id })).json().status, "running");
+  assert.equal((await b.call("task_cancel", { task_id: task.task_id })).json().status, "cancel requested");
+  assert.equal((await a.call("task_status", { task_id: task.task_id, wait_seconds: 10 })).json().status, "cancelled");
+  assert.equal((await b.call("task_status", { task_id: task.task_id })).json().status, "cancelled");
+  assert.deepEqual((await b.call("session_delete", { session_id: task.session_id })).json(), { deleted: [task.session_id] });
+});
+
+test("stale tasks and locks don't block anything", async (t) => {
+  const c = session(t);
+  mkdirSync(join(c.home, "tasks"), { recursive: true });
+  mkdirSync(join(c.home, "sessions"), { recursive: true });
+  const minuteAgo = new Date(Date.now() - 60_000);
+  // This test process is alive, but it stopped refreshing the task a minute ago (like a reused pid).
+  writeFileSync(
+    join(c.home, "tasks", "t_stale1.json"),
+    JSON.stringify({ id: "t_stale1", session_id: "s_stale1", status: "running", pid: process.pid, started_at: minuteAgo.toISOString(), heartbeat_at: minuteAgo.toISOString() }),
+  );
+  assert.equal((await c.call("task_status", { task_id: "t_stale1" })).json().status, "interrupted");
+
+  writeFileSync(join(c.home, "sessions", "s_stale1.json"), JSON.stringify({ id: "s_stale1", model: "tiny-llm", turns: [] }));
+  const lock = join(c.home, "sessions", "s_stale1.lock");
+  writeFileSync(lock, JSON.stringify({ pid: process.pid }));
+  utimesSync(lock, minuteAgo, minuteAgo);
+  assert.equal((await c.call("session_get")).json()[0].busy, undefined);
+
+  utimesSync(lock, new Date(), new Date()); // a fresh lock of a live process
+  assert.equal((await c.call("session_get")).json()[0].busy, true);
+  assert.match((await c.call("session_delete", { session_id: "s_stale1" })).text, /Busy sessions can't be deleted/);
+
+  utimesSync(lock, minuteAgo, minuteAgo);
+  assert.deepEqual((await c.call("session_delete", { session_id: "s_stale1" })).json(), { deleted: ["s_stale1"] });
+});
+
+test("a task survives when its folder can't be written", { skip: process.platform === "win32" }, async (t) => {
+  const c = session(t);
+  const task = (await c.call("task_start", { model: "tiny-llm", prompt: "[slow] write while read-only" })).json();
+  const folder = join(c.home, "tasks");
+  chmodSync(folder, 0o500);
+  t.after(() => chmodSync(folder, 0o700));
+  const done = await c.call("task_status", { task_id: task.task_id, wait_seconds: 15 });
+  assert.match(done.text, /^Answer 1 to: \[slow\] write while read-only/);
+  assert.deepEqual((await c.request("ping")).result, {});
+  assert.match((await c.call("session_send", { session_id: task.session_id, message: "next" })).text, /^Answer 2 to: next/);
+});
+
+test("broken session files don't break the session list", async (t) => {
+  const c = session(t);
+  mkdirSync(join(c.home, "sessions"), { recursive: true });
+  writeFileSync(join(c.home, "sessions", "s_bad1.json"), JSON.stringify({ id: "s_bad1" }));
+  writeFileSync(join(c.home, "sessions", "s_evil.json"), JSON.stringify({ id: "../../etc/x" }));
+  writeFileSync(join(c.home, "sessions", "s_junk.json"), "not json");
+  assert.deepEqual((await c.call("session_get")).json().map((s) => [s.session_id, s.exchanges]), [["s_bad1", 0]]);
+  assert.equal((await c.call("session_get", { session_id: "s_bad1" })).json().turns_total, 0);
 });
 
 test("a task whose process is gone shows as interrupted", async (t) => {

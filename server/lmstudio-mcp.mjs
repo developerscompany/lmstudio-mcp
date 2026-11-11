@@ -6,7 +6,7 @@
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { homedir, totalmem } from "node:os";
@@ -120,15 +120,32 @@ function writeJson(path, value) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.${process.pid}.tmp`;
   writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temp, path);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(temp, path);
+      return;
+    } catch (error) {
+      // On Windows an antivirus scan or another reader can hold the file for a moment.
+      const transient = process.platform === "win32" && ["EPERM", "EACCES", "EBUSY"].includes(error.code);
+      if (!transient || attempt === 5) {
+        rmSync(temp, { force: true });
+        throw error;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * attempt);
+    }
+  }
 }
 
-function listJson(folder) {
+const SESSION_ID = /^s_[a-z0-9]+$/;
+const TASK_ID = /^t_[a-z0-9]+$/;
+
+// Reads every <id>.json in a folder; files that aren't valid or whose id looks wrong are skipped.
+function listJson(folder, idPattern) {
   try {
     return readdirSync(join(HOME, folder))
       .filter((name) => name.endsWith(".json"))
       .map((name) => readJson(join(HOME, folder, name), null))
-      .filter(Boolean);
+      .filter((item) => typeof item?.id === "string" && idPattern.test(item.id));
   } catch {
     return [];
   }
@@ -136,7 +153,9 @@ function listJson(folder) {
 
 const defaultsPath = () => join(HOME, "model-defaults.json");
 const sessionPath = (id) => join(HOME, "sessions", `${id}.json`);
+const lockPath = (id) => join(HOME, "sessions", `${id}.lock`);
 const taskPath = (id) => join(HOME, "tasks", `${id}.json`);
+const cancelPath = (id) => join(HOME, "tasks", `${id}.cancel`);
 
 function modelKey(name) {
   return name.replace(/:\d+$/, ""); // "model:2" is the second loaded instance of "model"
@@ -488,26 +507,60 @@ async function unloadAll(instances, server, signal) {
   for (const i of instances) await api("POST", "/api/v1/models/unload", { instance_id: i.instance_id }, { server, signal, timeoutMs: 120_000 });
 }
 
+// One load per model at a time in this process: parallel calls for a model that isn't loaded yet would
+// otherwise each load their own copy.
+const modelLocks = new Map();
+
+async function withModelLock(model, fn) {
+  const key = modelKey(model);
+  const previous = modelLocks.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const mine = previous.then(() => gate);
+  modelLocks.set(key, mine);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (modelLocks.get(key) === mine) modelLocks.delete(key);
+  }
+}
+
+// Unloading a model while a session request or task uses it would cut that answer off.
+function assertModelIdle(model, exceptSessionId) {
+  const key = modelKey(model);
+  for (const session of listJson("sessions", SESSION_ID)) {
+    if (session.id === exceptSessionId || modelKey(String(session.model ?? "")) !== key) continue;
+    const lock = readLock(session.id);
+    if (lock) throw new UserError(`${model} is in use by ${lock.task_id ? `task ${lock.task_id}` : `session ${session.id}`}. Wait for it or cancel it first.`);
+  }
+}
+
 // Returns a loaded instance of `model`, loading it first if needed. With strict, the instance must have at
 // least the wanted context (the given one, else the model's saved default); reload replaces a smaller one.
-async function ensureLoaded(model, { context_length, strict = false, reload = false } = {}, signal) {
-  const server = await resolveServer();
-  const instances = (await loadedInstances(server, signal)).filter((i) => i.instance_id === model || i.model === model);
-  const wanted = context_length ?? defaultsFor(model).context_length;
-  const fitting = instances.find((i) => !strict || !wanted || (i.context_length ?? 0) >= wanted);
-  if (fitting) return { instance_id: fitting.instance_id, context_length: fitting.context_length };
-  if (instances.length) {
-    if (!reload) {
-      throw new UserError(
-        `${model} is loaded with a ${instances[0].context_length}-token context, but ${wanted} tokens are needed. ` +
-          "Call again with reload: true to unload it and load it with the larger context.",
-      );
+async function ensureLoaded(model, { context_length, strict = false, reload = false, session_id } = {}, signal) {
+  return withModelLock(model, async () => {
+    const server = await resolveServer();
+    const instances = (await loadedInstances(server, signal)).filter((i) => i.instance_id === model || i.model === model);
+    const wanted = context_length ?? defaultsFor(model).context_length;
+    const fitting = instances.find((i) => !strict || !wanted || (i.context_length ?? 0) >= wanted);
+    if (fitting) return { instance_id: fitting.instance_id, context_length: fitting.context_length };
+    if (instances.length) {
+      const have = instances[0].context_length;
+      if (!reload) {
+        throw new UserError(
+          `${model} is loaded with ${have ? `a ${have}-token context` : "an unknown context length"}, but ${wanted} tokens are needed. ` +
+            "Call again with reload: true to unload it and load it with the larger context.",
+        );
+      }
+      assertModelIdle(model, session_id);
+      await unloadAll(instances, server, signal);
     }
-    await unloadAll(instances, server, signal);
-  }
-  const { instance, report } = await loadModel(compact({ model: modelKey(model), context_length: wanted }), signal);
-  if (!instance) throw new UserError(`LM Studio did not report a loaded instance of ${model}.`);
-  return { ...instance, loaded_now: true, load_time_seconds: report.load_time_seconds };
+    const { instance, report } = await loadModel(compact({ model: modelKey(model), context_length: wanted }), signal);
+    if (!instance) throw new UserError(`LM Studio did not report a loaded instance of ${model}.`);
+    return { ...instance, loaded_now: true, load_time_seconds: report.load_time_seconds };
+  });
 }
 
 // ---------- answers, progress and context ----------
@@ -580,8 +633,6 @@ const STAT_KEYS = ["input_tokens", "total_output_tokens", "reasoning_output_toke
 
 // ---------- sessions ----------
 
-const busySessions = new Set();
-
 function saveSession(session) {
   writeJson(sessionPath(session.id), session);
 }
@@ -589,17 +640,76 @@ function saveSession(session) {
 function loadSession(id) {
   const session = readJson(sessionPath(id), null);
   if (!session) throw new UserError(`Unknown session ${id}. session_get lists the sessions.`);
+  session.turns = Array.isArray(session.turns) ? session.turns : [];
   return session;
 }
 
-function isBusy(sessionId) {
-  return busySessions.has(sessionId) || listTasks().some((t) => t.session_id === sessionId && t.status === "running");
+// A session runs one request at a time, also across Claude Code sessions on this computer. The holder keeps
+// sessions/<id>.lock fresh; a lock whose process is gone or that went stale is ignored.
+const LOCK_STALE_MS = 30_000;
+const heldLocks = new Map(); // session id -> heartbeat timer
+
+function readLock(id) {
+  let info;
+  try {
+    info = statSync(lockPath(id));
+  } catch {
+    return null;
+  }
+  const lock = readJson(lockPath(id), {});
+  const age = Date.now() - info.mtimeMs;
+  if (!Number.isInteger(lock.pid)) return age < 2000 ? lock : null; // being written right now
+  const held = lock.pid === process.pid ? heldLocks.has(id) : isAlive(lock.pid) && age < LOCK_STALE_MS;
+  return held ? lock : null;
 }
 
-function assertIdle(sessionId) {
-  const task = listTasks().find((t) => t.session_id === sessionId && t.status === "running");
-  if (task) throw new UserError(`Session ${sessionId} is busy with task ${task.id}. Wait with task_status or stop it with task_cancel.`);
-  if (busySessions.has(sessionId)) throw new UserError(`Session ${sessionId} is busy with another request.`);
+function isBusy(id) {
+  return Boolean(readLock(id));
+}
+
+// Takes the session's lock or explains who holds it. Returns the function that releases it.
+function lockSession(id, holder = {}) {
+  const current = readLock(id);
+  if (current) {
+    throw new UserError(
+      current.task_id
+        ? `Session ${id} is busy with task ${current.task_id}. Wait with task_status or stop it with task_cancel.`
+        : `Session ${id} is busy with another request.`,
+    );
+  }
+  mkdirSync(join(HOME, "sessions"), { recursive: true, mode: 0o700 });
+  rmSync(lockPath(id), { force: true }); // a stale lock, if any
+  let fd;
+  try {
+    fd = openSync(lockPath(id), "wx", 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new UserError(`Session ${id} is busy with another request.`);
+    throw error;
+  }
+  try {
+    writeSync(fd, JSON.stringify({ pid: process.pid, ...holder, since: now() }));
+  } finally {
+    closeSync(fd);
+  }
+  const timer = setInterval(() => {
+    try {
+      const time = new Date();
+      utimesSync(lockPath(id), time, time);
+    } catch {
+      // the next refresh tries again
+    }
+  }, 5000);
+  timer.unref?.();
+  heldLocks.set(id, timer);
+  return () => {
+    clearInterval(timer);
+    heldLocks.delete(id);
+    try {
+      rmSync(lockPath(id), { force: true });
+    } catch (error) {
+      log(`could not remove the lock of ${id}: ${error.message}`);
+    }
+  };
 }
 
 async function createSession(args, signal, { load = true } = {}) {
@@ -622,24 +732,62 @@ async function createSession(args, signal, { load = true } = {}) {
   return { session, instance };
 }
 
+// The saved exchanges since the last compaction, newest last, within roughly `budget` characters.
+function recentTranscript(session, budget) {
+  const lines = [];
+  let used = 0;
+  for (const turn of [...session.turns].reverse()) {
+    if (turn.role === "system") break; // compaction marker
+    const line = `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content ?? ""}`;
+    if (used + line.length > budget) break;
+    lines.unshift(line);
+    used += line.length;
+  }
+  return lines.join("\n\n");
+}
+
+// System prompt for a new chain: the session's instructions, the summary of compacted history and, when
+// LM Studio lost the conversation, the saved exchanges since then (about a quarter of the context).
+function chainStart(session, limit) {
+  const recent = recentTranscript(session, Math.max(4000, limit ?? 16000));
+  return (
+    [session.system_prompt, session.summary && `Summary of the conversation so far:\n${session.summary}`, recent && `Earlier messages of this conversation:\n${recent}`]
+      .filter(Boolean)
+      .join("\n\n") || undefined
+  );
+}
+
+// LM Studio answers 4xx when it no longer knows a previous_response_id, e.g. after it was restarted.
+function isLostChain(error) {
+  return error instanceof UserError && /HTTP 4\d\d/.test(error.message) && /previous|response/i.test(error.message);
+}
+
 // One exchange in a session. LM Studio keeps the history (store + previous_response_id), so only the new
-// message is sent; after session_compact the next exchange starts a new chain with the summary.
+// message is sent. A new chain (first message, after session_compact, or when LM Studio lost the
+// conversation) starts with chainStart().
 async function runTurn(session, { message, images, max_output_tokens, reload }, { signal, onEvent } = {}) {
   const input = buildInput(message, images);
-  const instance = await ensureLoaded(session.model, { context_length: session.context_length, strict: true, reload }, signal);
-  const system = [session.system_prompt, session.summary && `Summary of the conversation so far:\n${session.summary}`].filter(Boolean).join("\n\n");
+  const instance = await ensureLoaded(session.model, { context_length: session.context_length, strict: true, reload, session_id: session.id }, signal);
   const body = compact({
     model: instance.instance_id,
     input,
-    system_prompt: session.last_response_id ? undefined : system || undefined,
-    previous_response_id: session.last_response_id ?? undefined,
     store: true,
     temperature: session.temperature,
     max_output_tokens: max_output_tokens ?? session.max_output_tokens,
     reasoning: session.reasoning,
     integrations: session.integrations,
   });
-  const result = await chatStream(body, { signal, onEvent });
+  let result;
+  let rebuilt;
+  if (session.last_response_id) {
+    try {
+      result = await chatStream({ ...body, previous_response_id: session.last_response_id }, { signal, onEvent });
+    } catch (error) {
+      if (!isLostChain(error)) throw error;
+      rebuilt = "LM Studio no longer had this conversation, so it was rebuilt from the saved transcript.";
+    }
+  }
+  result ??= await chatStream(compact({ ...body, system_prompt: chainStart(session, instance.context_length) }), { signal, onEvent });
   const output = summarizeOutput(result);
   const stats = pick(result.stats, STAT_KEYS);
   session.instance_id = instance.instance_id;
@@ -649,7 +797,8 @@ async function runTurn(session, { message, images, max_output_tokens, reload }, 
   session.turns.push(compact({ role: "assistant", content: output.answer, tool_calls: output.tool_calls, stats, at: now() }));
   session.updated_at = now();
   saveSession(session);
-  return { ...output, stats, context: session.context, warning: result.warning ?? (result.response_id ? undefined : "LM Studio returned no response_id; the next message starts a new conversation.") };
+  const warnings = [rebuilt, result.warning, result.response_id ? undefined : "LM Studio returned no response_id; the next message starts a new conversation."];
+  return { ...output, stats, context: session.context, warning: warnings.filter(Boolean).join(" ") || undefined };
 }
 
 function turnReport(session, turn, includeReasoning) {
@@ -664,8 +813,10 @@ function turnReport(session, turn, includeReasoning) {
 // ---------- background tasks ----------
 
 const runningTasks = new Map(); // task id -> { task, controller, done }
+const finishedTasks = new Map(); // recent tasks of this process, in case their last save failed
 
 function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -674,41 +825,71 @@ function isAlive(pid) {
   }
 }
 
-// The live copy if the task runs in this process; a task whose process is gone is reported as interrupted.
+// Tasks of this process come from memory. A task running elsewhere needs a live process that refreshed
+// heartbeat_at recently; otherwise it was interrupted.
 function taskView(task) {
-  const live = runningTasks.get(task.id)?.task;
-  if (live) return live;
-  if (task.status === "running" && !isAlive(task.pid)) return { ...task, status: "interrupted" };
-  return task;
+  const own = runningTasks.get(task.id)?.task ?? finishedTasks.get(task.id);
+  if (own) return own;
+  if (task.status !== "running") return task;
+  const beat = Date.parse(task.heartbeat_at ?? task.started_at);
+  const orphan = task.pid === process.pid || !isAlive(task.pid) || !(Date.now() - beat < LOCK_STALE_MS);
+  return orphan ? { ...task, status: "interrupted" } : task;
 }
 
 function listTasks() {
-  return listJson("tasks").map(taskView);
+  return listJson("tasks", TASK_ID).map(taskView);
 }
 
 function getTask(id) {
-  const live = runningTasks.get(id)?.task;
-  if (live) return live;
+  const own = runningTasks.get(id)?.task ?? finishedTasks.get(id);
+  if (own) return own;
   const task = readJson(taskPath(id), null);
   if (!task) throw new UserError(`Unknown task ${id}. task_status without task_id lists the tasks.`);
   return taskView(task);
 }
 
-// Saves the task and reports whether another process asked to cancel it.
 function persistTask(task) {
-  if (readJson(taskPath(task.id), {}).cancel_requested) task.cancel_requested = true;
+  task.heartbeat_at = now();
   writeJson(taskPath(task.id), task);
-  return Boolean(task.cancel_requested);
 }
 
-function startTask(session, { prompt, images, max_output_tokens, reload }) {
-  assertIdle(session.id);
-  const task = { id: newId("t"), session_id: session.id, model: session.model, prompt, status: "running", pid: process.pid, started_at: now(), progress: { phase: "starting" } };
+// Keeps the tasks folder small: finished tasks go after 14 days, and beyond the newest 200.
+function pruneTasks() {
+  try {
+    const cutoff = Date.now() - 14 * 24 * 3600_000;
+    listJson("tasks", TASK_ID)
+      .filter((t) => t.status !== "running")
+      .sort((a, b) => String(b.started_at).localeCompare(String(a.started_at)))
+      .forEach((t, index) => {
+        if (index >= 200 || Date.parse(t.finished_at ?? t.started_at) < cutoff) rmSync(taskPath(t.id), { force: true });
+      });
+  } catch (error) {
+    log(`could not prune old tasks: ${error.message}`);
+  }
+}
+
+function startTask(sessionId, { prompt, images, max_output_tokens, reload }) {
+  const task = { id: newId("t"), session_id: sessionId, prompt, status: "running", pid: process.pid, started_at: now(), progress: { phase: "starting" } };
+  const release = lockSession(sessionId, { task_id: task.id });
+  let session;
+  try {
+    session = loadSession(sessionId); // a fresh copy now that the lock is held
+    task.model = session.model;
+    persistTask(task);
+  } catch (error) {
+    release();
+    throw error;
+  }
+  pruneTasks();
   const controller = new AbortController();
-  busySessions.add(session.id);
-  persistTask(task);
+  // Every 2 seconds: save the progress (which is also the heartbeat) and look for a cancel request from another process.
   const timer = setInterval(() => {
-    if (persistTask(task)) controller.abort();
+    try {
+      if (existsSync(cancelPath(task.id))) controller.abort();
+      persistTask(task);
+    } catch (error) {
+      log(`could not save task ${task.id}: ${error.message}`);
+    }
   }, 2000);
   const done = runTurn(session, { message: prompt, images, max_output_tokens, reload }, { signal: controller.signal, onEvent: (event) => trackEvent(task.progress, event) })
     .then((turn) => Object.assign(task, { status: "done", answer: turn.answer, reasoning: turn.reasoning || undefined, tool_calls: turn.tool_calls, stats: turn.stats, context: turn.context, warning: turn.warning }))
@@ -717,10 +898,18 @@ function startTask(session, { prompt, images, max_output_tokens, reload }) {
       clearInterval(timer);
       task.finished_at = now();
       if (task.status === "done") delete task.progress;
-      busySessions.delete(session.id);
+      finishedTasks.set(task.id, task);
+      if (finishedTasks.size > 50) finishedTasks.delete(finishedTasks.keys().next().value);
       runningTasks.delete(task.id);
-      writeJson(taskPath(task.id), task);
-    });
+      release();
+      try {
+        rmSync(cancelPath(task.id), { force: true });
+        writeJson(taskPath(task.id), task);
+      } catch (error) {
+        log(`could not save task ${task.id}: ${error.message}`);
+      }
+    })
+    .catch((error) => log(error?.stack ?? error));
   runningTasks.set(task.id, { task, controller, done });
   return task;
 }
@@ -947,19 +1136,23 @@ const TOOLS = [
       if (lmsKeys.length && !isLocal(server.url)) {
         throw new UserError(`load_model with ${lmsKeys.join(", ")} needs LM Studio on this machine (it uses the lms CLI), but LMSTUDIO_BASE_URL points to ${server.url}.`);
       }
-      const existing = settings.identifier ? [] : (await loadedInstances(server, signal)).filter((i) => i.model === settings.model);
-      if (existing.length) {
-        if (!replace) return { status: "already_loaded", instances: existing, note: "Pass replace: true to unload it and load it again with other settings." };
-        await unloadAll(existing, server, signal);
-      }
-      const { report } = await loadModel(settings, signal);
-      return compact({ ...report, replaced: existing.map((i) => i.instance_id) });
+      if (replace && settings.identifier) throw new UserError("replace doesn't apply with identifier: an identifier always loads a separate instance.");
+      return withModelLock(settings.model, async () => {
+        const existing = settings.identifier ? [] : (await loadedInstances(server, signal)).filter((i) => i.model === settings.model);
+        if (existing.length) {
+          if (!replace) return { status: "already_loaded", instances: existing, note: "Pass replace: true to unload it and load it again with other settings." };
+          assertModelIdle(settings.model);
+          await unloadAll(existing, server, signal);
+        }
+        const { report } = await loadModel(settings, signal);
+        return compact({ ...report, replaced: existing.map((i) => i.instance_id) });
+      });
     },
   },
   {
     name: "unload_model",
     title: "LM Studio: unload model",
-    description: "Unload a loaded model instance to free memory, or every loaded model with all: true.",
+    description: "Unload a loaded model instance to free memory, or every loaded model with all: true. Refuses while a session request or task uses the model.",
     inputSchema: {
       type: "object",
       properties: {
@@ -971,7 +1164,10 @@ const TOOLS = [
     async run({ instance_id, all }, { signal }) {
       if (!all && !instance_id) throw new UserError("Pass instance_id (see list_models) or all: true.");
       const server = await resolveServer();
-      const ids = all ? (await loadedInstances(server, signal)).map((i) => i.instance_id) : [instance_id];
+      const loaded = await loadedInstances(server, signal);
+      const targets = all ? loaded : loaded.filter((i) => i.instance_id === instance_id);
+      for (const i of targets) assertModelIdle(i.model);
+      const ids = all ? targets.map((i) => i.instance_id) : [instance_id];
       if (!ids.length) return "No models are loaded.";
       const unloaded = [];
       for (const id of ids) {
@@ -1080,15 +1276,15 @@ const TOOLS = [
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async run(args, { signal, progress }) {
-      const session = loadSession(args.session_id);
-      assertIdle(session.id);
-      busySessions.add(session.id);
+      loadSession(args.session_id); // an unknown id fails before anything is locked
+      const release = lockSession(args.session_id);
       try {
+        const session = loadSession(args.session_id); // a fresh copy now that the lock is held
         const state = {};
         const turn = await runTurn(session, args, { signal, onEvent: (event) => trackEvent(state, event) && progress(progressLine(state)) });
         return turnReport(session, turn, args.include_reasoning);
       } finally {
-        busySessions.delete(session.id);
+        release();
       }
     },
   },
@@ -1107,14 +1303,14 @@ const TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: false },
     async run({ session_id, last = 10, full = false }) {
       if (!session_id) {
-        const sessions = listJson("sessions").sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+        const sessions = listJson("sessions", SESSION_ID).sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
         if (!sessions.length) return "No sessions yet. Start one with session_start.";
         return sessions.map((s) =>
           compact({
             session_id: s.id,
             title: s.title,
             model: s.model,
-            exchanges: s.turns.filter((t) => t.role === "assistant").length,
+            exchanges: (Array.isArray(s.turns) ? s.turns : []).filter((t) => t?.role === "assistant").length,
             context: formatContext(s.context),
             busy: isBusy(s.id) || undefined,
             updated_at: s.updated_at,
@@ -1154,23 +1350,26 @@ const TOOLS = [
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     async run({ session_id, instructions }, { signal, progress }) {
-      const session = loadSession(session_id);
-      if (!session.last_response_id) return "Nothing to compact: the current context of this session is still empty.";
-      assertIdle(session.id);
-      busySessions.add(session.id);
+      loadSession(session_id); // an unknown id fails before anything is locked
+      const release = lockSession(session_id);
       try {
-        const instance = await ensureLoaded(session.model, { context_length: session.context_length, strict: true }, signal);
+        const session = loadSession(session_id);
+        if (!session.last_response_id) return "Nothing to compact: the current context of this session is still empty.";
+        const instance = await ensureLoaded(session.model, { context_length: session.context_length, strict: true, session_id }, signal);
         const state = {};
-        const result = await chatStream(
-          compact({
-            model: instance.instance_id,
-            input: instructions ? `${COMPACT_PROMPT}\n\nAlso keep: ${instructions}` : COMPACT_PROMPT,
-            previous_response_id: session.last_response_id,
-            store: false,
-            reasoning: session.reasoning,
-          }),
-          { signal, onEvent: (event) => trackEvent(state, event) && progress(progressLine(state)) },
-        );
+        const onEvent = (event) => trackEvent(state, event) && progress(progressLine(state));
+        const prompt = instructions ? `${COMPACT_PROMPT}\n\nAlso keep: ${instructions}` : COMPACT_PROMPT;
+        const base = compact({ model: instance.instance_id, store: false, reasoning: session.reasoning });
+        let result;
+        try {
+          result = await chatStream({ ...base, input: prompt, previous_response_id: session.last_response_id }, { signal, onEvent });
+        } catch (error) {
+          if (!isLostChain(error)) throw error;
+          // LM Studio no longer has the conversation: summarize the saved transcript instead.
+          const history = [session.summary && `Summary so far:\n${session.summary}`, recentTranscript(session, Math.max(4000, instance.context_length ?? 16000))];
+          const input = `${prompt}\n\nConversation:\n${history.filter(Boolean).join("\n\n")}`;
+          result = await chatStream(compact({ ...base, input, system_prompt: session.system_prompt }), { signal, onEvent });
+        }
         const summary = summarizeOutput(result).answer;
         if (!summary) throw new UserError("The model returned an empty summary; the session was left unchanged.");
         const before = session.context;
@@ -1183,7 +1382,7 @@ const TOOLS = [
         saveSession(session);
         return compact({ session_id: session.id, context_before: formatContext(before), context_now: formatContext(session.context), summary: clip(summary, 2000) });
       } finally {
-        busySessions.delete(session.id);
+        release();
       }
     },
   },
@@ -1198,14 +1397,19 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     async run({ session_id, all }) {
       if (!all && !session_id) throw new UserError("Pass session_id or all: true.");
-      const ids = all ? listJson("sessions").map((s) => s.id) : [loadSession(session_id).id];
+      if (session_id) loadSession(session_id); // unknown ids fail here
+      const ids = all ? listJson("sessions", SESSION_ID).map((s) => s.id) : [session_id];
       if (!ids.length) return "No sessions to delete.";
       const busy = ids.filter(isBusy);
       if (busy.length) throw new UserError(`Busy sessions can't be deleted: ${busy.join(", ")}. Cancel their tasks first.`);
-      const tasks = listJson("tasks");
+      const tasks = listJson("tasks", TASK_ID);
       for (const id of ids) {
         rmSync(sessionPath(id), { force: true });
-        for (const t of tasks.filter((task) => task.session_id === id)) rmSync(taskPath(t.id), { force: true });
+        rmSync(lockPath(id), { force: true });
+        for (const t of tasks.filter((task) => task.session_id === id)) {
+          rmSync(taskPath(t.id), { force: true });
+          rmSync(cancelPath(t.id), { force: true });
+        }
       }
       return { deleted: ids };
     },
@@ -1244,7 +1448,7 @@ const TOOLS = [
       const session = args.session_id
         ? loadSession(args.session_id)
         : (await createSession({ ...pick(args, SESSION_KEYS), title: args.title ?? clip(args.prompt, 60) }, signal, { load: false })).session;
-      const task = startTask(session, {
+      const task = startTask(session.id, {
         prompt: args.prompt,
         images: args.images,
         max_output_tokens: args.session_id ? args.max_output_tokens : undefined, // a new session keeps it as its own setting
@@ -1301,7 +1505,8 @@ const TOOLS = [
       }
       const task = getTask(task_id);
       if (task.status !== "running") return { task_id, status: task.status, note: "The task is not running." };
-      writeJson(taskPath(task_id), { ...readJson(taskPath(task_id), task), cancel_requested: true });
+      // The task runs in another process, which checks for this file every 2 seconds.
+      writeFileSync(cancelPath(task_id), now(), { mode: 0o600 });
       return { task_id, status: "cancel requested", note: "The task runs in another Claude Code session and stops within a few seconds." };
     },
   },
@@ -1538,7 +1743,14 @@ process.stdin.on("data", (chunk) => {
 });
 process.stdin.on("end", () => {
   onLine(pending + decoder.end());
-  // Background tasks can't outlive this process: record them as interrupted.
-  for (const { task } of runningTasks.values()) writeJson(taskPath(task.id), { ...task, status: "interrupted", finished_at: now() });
+  // Background tasks can't outlive this process: record them as interrupted and free their sessions.
+  for (const { task } of runningTasks.values()) {
+    try {
+      writeJson(taskPath(task.id), { ...task, status: "interrupted", finished_at: now() });
+    } catch {
+      // other processes see the stale heartbeat instead
+    }
+  }
+  for (const id of heldLocks.keys()) rmSync(lockPath(id), { force: true });
   process.exit(0);
 });
