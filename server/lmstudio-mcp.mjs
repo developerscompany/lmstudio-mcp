@@ -15,7 +15,7 @@ import { dirname, extname, isAbsolute, join } from "node:path";
 import { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const QUICK_MS = 30_000;
 const STREAM_IDLE_MS = 10 * 60_000; // give up on a streamed answer after 10 minutes without any event
@@ -36,7 +36,7 @@ const COMPACT_PROMPT =
 const INSTRUCTIONS = `Tools for the user's LM Studio: server control, models, sessions, background tasks and local inference.
 - Start with server_status. If LM Studio is not reachable, call server_start (not available when only a URL of another machine is set).
 - Models: list_models shows what is downloaded and loaded. Check memory with estimate_load before loading. Ask the user before loading a model that needs more than about half of system_ram (in server_status: the RAM of the machine that runs LM Studio), and before every download_model: downloads can be tens of GB. load_model keeps a model that is already loaded; pass replace: true to reload it with other settings.
-- Context: model_defaults saves per-model load settings (context_length, ttl, gpu, parallel) that load_model, chat, sessions and tasks then use. When the user says a model needs a certain context (for example 262144 tokens), save it there.
+- Context: model_defaults saves per-model load settings (context_length, ttl, gpu, parallel) that load_model, chat, sessions and tasks then use. When the user says a model needs a certain context (for example 262144 tokens), save it there. Saved defaults are the user's choice: leave context_length out of load_model, session_start, task_start, chat and estimate_load so that they apply, and pass it only when the user asks for another value.
 - Sessions are conversations kept in LM Studio: session_start (model, optional system_prompt and context_length), then session_send. Every answer shows how full the context is; past ${CONTEXT_WARNING_PERCENT}% run session_compact or start a new session. session_get lists the sessions or shows one.
 - Tasks run a session turn in the background: task_start returns a task_id at once; follow it with task_status (wait_seconds waits for the result) and stop it with task_cancel. Use tasks for long jobs so you can keep working meanwhile. Tasks stop when this Claude Code session ends.
 - chat is a one-off prompt without history. chat, sessions and tasks load the model when needed.
@@ -775,8 +775,28 @@ function formatContext(context) {
   return context.limit ? `${n(context.used ?? 0)} / ${n(context.limit)} tokens (${context.percent ?? 0}%)` : `${n(context.used ?? 0)} tokens`;
 }
 
+function fullContextWarning(context) {
+  return context?.percent >= 99 ? "The context is full, so the answer is cut off or missing: use a larger context, compact the session or turn reasoning down." : undefined;
+}
+
 function contextWarning(context) {
+  if (context?.percent >= 99) return fullContextWarning(context);
   return context?.percent >= CONTEXT_WARNING_PERCENT ? "The context is getting full: run session_compact or start a new session." : undefined;
+}
+
+// The answer of the model for a report; when there is none, the end of its reasoning shows what went wrong.
+function answerParts(answer, reasoning, includeReasoning) {
+  const parts = [answer || "(empty answer)"];
+  if (includeReasoning && reasoning) parts.push(`--- reasoning ---\n${reasoning}`);
+  else if (!answer && reasoning) parts.push(`--- the model gave no answer; its reasoning ended with ---\n${tail(reasoning, 1500)}`);
+  return parts;
+}
+
+// A caller that passes a smaller context than the saved default has probably overridden the user's choice by accident.
+function belowDefaultNote(model, contextLength) {
+  const saved = defaultsFor(model).context_length;
+  if (!contextLength || !saved || contextLength >= saved) return undefined;
+  return `context_length ${contextLength} is below the saved default of this model (${saved}). Unless the user asked for it, leave context_length out.`;
 }
 
 function allWarnings(warning, context) {
@@ -976,8 +996,7 @@ async function runTurn(session, { message, images, files, max_output_tokens, rel
 }
 
 function turnReport(session, turn, includeReasoning) {
-  const parts = [turn.answer || "(empty answer)"];
-  if (includeReasoning && turn.reasoning) parts.push(`--- reasoning ---\n${turn.reasoning}`);
+  const parts = answerParts(turn.answer, turn.reasoning, includeReasoning);
   if (turn.tool_calls?.length) parts.push(`--- tool calls by the local model ---\n${JSON.stringify(turn.tool_calls)}`);
   const meta = compact({ session_id: session.id, context: formatContext(turn.context), warning: allWarnings(turn.warning, turn.context), stats: turn.stats });
   parts.push(`--- session ---\n${JSON.stringify(meta)}`);
@@ -1103,7 +1122,7 @@ function taskReport(task) {
   }
   if (task.status !== "done") return compact({ ...head, answer_so_far: tail(task.progress?.partial, 1000) });
   const meta = compact({ ...head, context: formatContext(task.context), warning: allWarnings(task.warning, task.context), tool_calls: task.tool_calls, stats: task.stats });
-  return `${task.answer || "(empty answer)"}\n\n--- task ---\n${JSON.stringify(meta)}`;
+  return [...answerParts(task.answer, task.reasoning, false), `--- task ---\n${JSON.stringify(meta)}`].join("\n\n");
 }
 
 // ---------- tools ----------
@@ -1279,7 +1298,7 @@ const TOOLS = [
       required: ["model"],
       properties: {
         model: S.model,
-        context_length: { ...S.context_length, description: "Context length to estimate for. Default: the model's saved default." },
+        context_length: { ...S.context_length, description: "Context length to estimate for. Default: the model's saved default. Leave it out unless the user asks for a specific context: a saved default is the user's choice for this model." },
         gpu: S.gpu,
       },
     },
@@ -1305,7 +1324,7 @@ const TOOLS = [
       required: ["model"],
       properties: {
         model: S.model,
-        context_length: { ...S.context_length, description: "Context window in tokens. Default: the saved default, else the model's own setting." },
+        context_length: { ...S.context_length, description: "Context window in tokens. Default: the saved default, else the model's own setting. Leave it out unless the user asks for a specific context: a saved default is the user's choice for this model." },
         ttl: S.ttl,
         gpu: S.gpu,
         parallel: S.parallel,
@@ -1333,7 +1352,7 @@ const TOOLS = [
           await unloadAll(existing, server, signal);
         }
         const { report } = await loadModel(settings, signal);
-        return compact({ ...report, replaced: existing.map((i) => i.instance_id) });
+        return compact({ ...report, replaced: existing.map((i) => i.instance_id), note: belowDefaultNote(settings.model, settings.context_length) });
       });
     },
   },
@@ -1424,7 +1443,7 @@ const TOOLS = [
         model: S.model,
         title: { type: "string", description: "Short name to recognise the session later." },
         system_prompt: S.system_prompt,
-        context_length: { ...S.context_length, description: "Context the session needs, e.g. 262144. Default: the model's saved default." },
+        context_length: { ...S.context_length, description: "Context the session needs. Default: the model's saved default. Leave it out unless the user asks for a specific context: a saved default is the user's choice for this model." },
         reload: S.reload,
         temperature: S.temperature,
         max_output_tokens: S.max_output_tokens,
@@ -1443,6 +1462,7 @@ const TOOLS = [
         context: formatContext(session.context),
         loaded_now: instance.loaded_now,
         load_time_seconds: instance.load_time_seconds,
+        note: belowDefaultNote(args.model, args.context_length),
       });
     },
   },
@@ -1618,7 +1638,7 @@ const TOOLS = [
         model: { ...S.model, description: "Model for a new session, when session_id is not given." },
         title: { type: "string", description: "Name for the new session. Default: the start of the prompt." },
         system_prompt: S.system_prompt,
-        context_length: { ...S.context_length, description: "Context the new session needs. Default: the model's saved default." },
+        context_length: { ...S.context_length, description: "Context the new session needs. Default: the model's saved default. Leave it out unless the user asks for a specific context: a saved default is the user's choice for this model." },
         reload: S.reload,
         temperature: S.temperature,
         max_output_tokens: S.max_output_tokens,
@@ -1645,7 +1665,8 @@ const TOOLS = [
         max_output_tokens: args.session_id ? args.max_output_tokens : undefined, // a new session keeps it as its own setting
         reload: args.reload,
       });
-      return { task_id: task.id, session_id: session.id, status: task.status, next: "task_status with wait_seconds to wait for the result; task_cancel to stop it." };
+      const note = args.model ? belowDefaultNote(args.model, args.context_length) : undefined;
+      return compact({ task_id: task.id, session_id: session.id, status: task.status, note, next: "task_status with wait_seconds to wait for the result; task_cancel to stop it." });
     },
   },
   {
@@ -1719,7 +1740,7 @@ const TOOLS = [
         temperature: S.temperature,
         max_output_tokens: S.max_output_tokens,
         reasoning: S.reasoning,
-        context_length: { ...S.context_length, description: "Minimum context for this prompt; the model is loaded with it if needed." },
+        context_length: { ...S.context_length, description: "Minimum context for this prompt; the model is loaded with it if needed. Default: the model's saved default. Leave it out unless the user asks for a specific context: a saved default is the user's choice for this model." },
         reload: S.reload,
         integrations: S.integrations,
         include_reasoning: S.include_reasoning,
@@ -1735,10 +1756,11 @@ const TOOLS = [
         { signal, onEvent: (event) => trackEvent(state, event) && progress(progressLine(state)) },
       );
       const output = summarizeOutput(result);
-      const parts = [output.answer || "(empty answer)"];
-      if (args.include_reasoning && output.reasoning) parts.push(`--- reasoning ---\n${output.reasoning}`);
+      const parts = answerParts(output.answer, output.reasoning, args.include_reasoning);
       if (output.tool_calls.length) parts.push(`--- tool calls by the local model ---\n${JSON.stringify(output.tool_calls)}`);
-      const meta = compact({ model_instance_id: result.model_instance_id, loaded_now: instance.loaded_now, warning: result.warning, stats: pick(result.stats, STAT_KEYS) });
+      const context = contextUsage(result.stats, instance.context_length);
+      const warning = [result.warning, fullContextWarning(context)].filter(Boolean).join(" ") || undefined;
+      const meta = compact({ model_instance_id: result.model_instance_id, loaded_now: instance.loaded_now, context: formatContext(context), warning, stats: pick(result.stats, STAT_KEYS) });
       parts.push(`--- meta ---\n${JSON.stringify(meta)}`);
       return parts.join("\n\n");
     },

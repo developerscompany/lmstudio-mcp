@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 (2026-11-11)
+
+Found by running a real task through a fresh Claude Code session.
+
+- Claude is now told to leave `context_length` out so that a model's saved default applies; a call that asks for less than the saved default gets a note in its result. Before, Claude picked a small context by itself and the model ran out of room.
+- When the context fills up before the model gets to its answer, the reply says so and shows where its reasoning ended, instead of only "(empty answer)". `chat` reports context use too.
+
 ## 0.3.0 (2026-11-11)
 
 - `files` for `chat`, `session_send` and `task_start`: paths to text files that the plugin reads and adds to the message, so Claude doesn't have to paste code, logs or documents.

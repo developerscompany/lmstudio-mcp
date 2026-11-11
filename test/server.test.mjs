@@ -108,6 +108,7 @@ const routes = {
 // "[slow]" / "[very slow]" in the text slow the stream down, "[fill]" reports 85% of the context as used,
 // "[error]" fails during the answer, "[bad request]" is refused with HTTP 400 and "[too long]" behaves like a
 // request that is larger than the context: a stream that ends at once, or HTTP 500 without streaming.
+// "[no answer]" fills the context with reasoning and never gets to an answer.
 async function chat(body, res) {
   const instance = loaded.get(body.model);
   if (!instance) return send(res, 404, { error: { type: "model_not_found", message: `Model ${body.model} is not loaded` } });
@@ -128,13 +129,16 @@ async function chat(body, res) {
   if (text.includes("[bad request]")) return send(res, 400, { error: { message: "Invalid response format", type: "invalid_request", param: "input" } });
   const answer = text.startsWith("Summarize our conversation") ? "SUMMARY: we talked." : `Answer ${depth} to: ${text}`;
   const toolCall = { tool: "search", arguments: { q: "x" }, output: "found", provider_info: { type: "plugin", plugin_id: body.integrations?.[0] } };
+  const noAnswer = text.includes("[no answer]");
   const result = {
     model_instance_id: body.model,
     output: text.includes("[error]")
       ? []
-      : [{ type: "reasoning", content: "thinking" }, ...(body.integrations ? [{ type: "tool_call", ...toolCall }] : []), { type: "message", content: answer }],
+      : noAnswer
+        ? [{ type: "reasoning", content: "First I look at the file. Then I keep thinking and never finish" }]
+        : [{ type: "reasoning", content: "thinking" }, ...(body.integrations ? [{ type: "tool_call", ...toolCall }] : []), { type: "message", content: answer }],
     stats: {
-      input_tokens: text.includes("[fill]") ? Math.round(instance.context_length * 0.85) : 100 * depth,
+      input_tokens: noAnswer ? instance.context_length - 20 : text.includes("[fill]") ? Math.round(instance.context_length * 0.85) : 100 * depth,
       total_output_tokens: 20,
       reasoning_output_tokens: 5,
       tokens_per_second: 42,
@@ -824,6 +828,30 @@ test("a request that is larger than the context is explained", async (t) => {
   assert.equal(result.isError, true);
   assert.equal(result.text, "The request needs 20,523 tokens, but the model is loaded with a 4,096-token context. Send less, run session_compact, or load the model with a larger context.");
   assert.deepEqual(sent("/api/v1/chat").map((r) => r.body.stream), [true, undefined]);
+});
+
+test("an answer that never came because the context filled up is explained", async (t) => {
+  const c = session(t);
+  const chat = await c.call("chat", { model: "tiny-llm", prompt: "[no answer] think hard" });
+  assert.match(chat.text, /^\(empty answer\)\n\n--- the model gave no answer; its reasoning ended with ---\nFirst I look at the file\. Then I keep thinking and never finish\n\n--- meta ---/);
+  assert.equal(chat.meta().context, "4,096 / 4,096 tokens (100%)");
+  assert.match(chat.meta().warning, /^The context is full, so the answer is cut off or missing/);
+
+  const task = (await c.call("task_start", { model: "tiny-llm", prompt: "[no answer] review" })).json();
+  const done = await c.call("task_status", { task_id: task.task_id, wait_seconds: 10 });
+  assert.match(done.text, /^\(empty answer\)\n\n--- the model gave no answer; its reasoning ended with ---\nFirst I look/);
+  assert.match(done.meta().warning, /^The context is full/);
+});
+
+test("a context below the saved default is pointed out", async (t) => {
+  const c = session(t);
+  await c.call("model_defaults", { model: "tiny-llm", context_length: 16384 });
+  const note = /context_length 4096 is below the saved default of this model \(16384\)/;
+  assert.match((await c.call("load_model", { model: "tiny-llm", context_length: 4096 })).json().note, note);
+  assert.match((await c.call("session_start", { model: "tiny-llm", context_length: 4096 })).json().note, note);
+  assert.match((await c.call("task_start", { model: "tiny-llm", context_length: 4096, prompt: "job" })).json().note, note);
+  await c.call("unload_model", { all: true }).catch(() => {});
+  assert.equal((await c.call("session_start", { model: "tiny-llm", reload: true })).json().note, undefined);
 });
 
 test("embed returns the cosine similarity matrix", async (t) => {
