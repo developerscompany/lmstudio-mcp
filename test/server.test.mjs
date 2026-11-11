@@ -1,7 +1,8 @@
-// Runs the MCP server against a fake LM Studio (REST API with streaming) and a fake `lms` CLI. Run with: npm test
+// Runs the MCP server against a fake LM Studio (REST API with streaming), a fake `lms` CLI and a fake `ssh`.
+// Run with: npm test
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,6 +14,8 @@ const SERVER = join(dirname(fileURLToPath(import.meta.url)), "..", "server", "lm
 const work = mkdtempSync(join(tmpdir(), "lmstudio-mcp-test-"));
 const fakeLms = join(work, "lms");
 const lmsLog = join(work, "lms.log");
+const sshLog = join(work, "ssh.log");
+const SSH = { LMSTUDIO_SSH_HOST: "studio", LMS_PATH: "", PATH: `${join(work, "bin")}:${process.env.PATH}` }; // server settings for the SSH tests
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------- fake LM Studio ----------
@@ -189,6 +192,7 @@ const stopped = process.env.FAKE_LMS_STOPPED_PORT;
   else if (command === "server" && sub === "start") say("Success! Server is now running on port ${port}");
   else if (command === "server" && sub === "stop") say("Stopped the server");
   else if (command === "ps") console.log(JSON.stringify(await call("/__lms/ps")));
+  else if (command === "runtime" && sub === "survey") console.log(JSON.stringify({ status: "ok", engines: [{ name: "a" }, { name: "b", memoryInfo: { ramCapacity: 64 * 2 ** 30 } }] }));
   else if (command === "load" && args.includes("--estimate-only")) say("Model: " + sub + "\\nEstimated Total Memory: 1.00 GiB");
   else if (command === "load") {
     await call("/__lms/load", { model: sub, context_length: Number(flag("--context-length")) || undefined, ttl: Number(flag("--ttl")) || undefined, identifier: flag("--identifier") });
@@ -202,6 +206,47 @@ const stopped = process.env.FAKE_LMS_STOPPED_PORT;
 `,
   );
   chmodSync(fakeLms, 0o755);
+
+  // The "other machine" for the SSH tests: its home has lms where LM Studio installs it.
+  mkdirSync(join(work, "remote", ".lmstudio", "bin"), { recursive: true });
+  symlinkSync(fakeLms, join(work, "remote", ".lmstudio", "bin", "lms"));
+  // A fake ssh: `-W host:port` pipes stdin and stdout to that port, anything else runs the command line
+  // in a shell, as the login shell of the other machine would.
+  mkdirSync(join(work, "bin"));
+  writeFileSync(
+    join(work, "bin", "ssh"),
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const options = [];
+const rest = [];
+let forward;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "-o") options.push(args[++i]);
+  else if (args[i] === "-W") forward = args[++i];
+  else rest.push(args[i]);
+}
+const [host, command] = rest;
+require("node:fs").appendFileSync(${JSON.stringify(sshLog)}, JSON.stringify({ host, forward, command, options }) + "\\n");
+if (host === "unreachable") {
+  process.stderr.write("ssh: connect to host unreachable port 22: Operation timed out\\n");
+  process.exit(255);
+}
+if (forward) {
+  const socket = require("node:net").connect(Number(forward.split(":")[1]), forward.split(":")[0]);
+  process.stdin.pipe(socket);
+  socket.pipe(process.stdout);
+  socket.on("error", (error) => {
+    process.stderr.write("channel 0: open failed: connect failed: " + error.message + "\\n");
+    process.exit(255);
+  });
+  socket.on("close", () => process.exit(0));
+} else {
+  const child = require("node:child_process").spawn("sh", ["-c", command], { stdio: "inherit", env: { ...process.env, HOME: ${JSON.stringify(join(work, "remote"))} } });
+  child.on("close", (code) => process.exit(code ?? 1));
+}
+`,
+  );
+  chmodSync(join(work, "bin", "ssh"), 0o755);
 });
 
 after(() => {
@@ -214,6 +259,7 @@ beforeEach(() => {
   loaded = new Map([["tiny-embed", { model: "tiny-embed", context_length: 2048 }]]);
   requests.length = 0;
   writeFileSync(lmsLog, "");
+  writeFileSync(sshLog, "");
 });
 
 function lmsCalls() {
@@ -221,6 +267,10 @@ function lmsCalls() {
 }
 
 const sent = (url) => requests.filter((r) => r.url === url);
+
+function sshCalls() {
+  return readFileSync(sshLog, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
 
 // ---------- minimal MCP client ----------
 
@@ -480,6 +530,64 @@ test("lms-based tools refuse to act on a remote LM Studio", async (t) => {
     assert.match(result.text, /needs LM Studio on this machine/, name);
   }
   assert.deepEqual(lmsCalls(), []);
+});
+
+// ---------- LM Studio on another machine over SSH ----------
+
+test("over SSH, lms runs on the other machine and API requests travel through ssh", async (t) => {
+  const c = session(t, { ...SSH, LMSTUDIO_BASE_URL: "http://192.0.2.1:9" }); // the URL is ignored
+  const status = (await c.call("server_status")).json();
+  assert.equal(status.reachable, true);
+  assert.equal(status.ssh_host, "studio");
+  assert.equal(status.url_source, "lms on studio (SSH)");
+  assert.equal(status.base_url, `http://127.0.0.1:${port}`);
+  assert.equal(status.lms_cli.path, "studio:~/.lmstudio/bin/lms");
+  assert.equal(status.system_ram, "64 GiB");
+  assert.equal((await c.call("list_models")).json().length, 3);
+  assert.match((await c.call("chat", { model: "tiny-llm", prompt: "Hi" })).text, /^Answer 1 to: Hi/);
+  assert.match((await c.call("estimate_load", { model: "tiny-llm" })).text, /System RAM of studio: 64 GiB$/);
+
+  const calls = sshCalls();
+  assert.ok(calls.every((call) => call.host === "studio" && call.options.includes("BatchMode=yes")));
+  assert.ok(calls.some((call) => call.command === `env -u LMS_SERVER_HOST "$HOME/.lmstudio/bin/lms" 'server' 'status' '--json'`));
+  const forwards = calls.filter((call) => call.forward);
+  assert.ok(forwards.length >= 3);
+  assert.ok(forwards.every((call) => call.forward === `127.0.0.1:${port}`));
+});
+
+test("over SSH, arguments reach lms exactly as given", async (t) => {
+  const c = session(t, SSH);
+  const identifier = `it's a "test" $HOME; echo x`;
+  const result = (await c.call("load_model", { model: "tiny-llm", ttl: 60, identifier })).json();
+  assert.equal(result.status, "loaded");
+  assert.equal(result.instances[0].instance_id, identifier);
+  const load = readFileSync(lmsLog, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)).find((args) => args[0] === "load");
+  assert.deepEqual(load, ["load", "tiny-llm", "-y", "--ttl", "60", "--identifier", identifier]);
+});
+
+test("over SSH, problems with the connection are reported clearly", async (t) => {
+  const unreachable = await session(t, { ...SSH, LMSTUDIO_SSH_HOST: "unreachable" }).call("server_status");
+  assert.equal(unreachable.isError, true);
+  assert.match(unreachable.text, /^Cannot reach unreachable over SSH: ssh: connect to host unreachable port 22: Operation timed out/);
+
+  const noLms = await session(t, { ...SSH, LMS_PATH: "/nonexistent/lms" }).call("list_models");
+  assert.equal(noLms.isError, true);
+  assert.match(noLms.text, /`lms` not found on studio/);
+
+  writeFileSync(sshLog, "");
+  const option = await session(t, { ...SSH, LMSTUDIO_SSH_HOST: "-oProxyCommand=touch /tmp/x" }).call("list_models");
+  assert.equal(option.isError, true);
+  assert.match(option.text, /is not a usable SSH host/);
+  assert.deepEqual(sshCalls(), []);
+});
+
+test("over SSH, a stopped server is started with lms on the other machine", async (t) => {
+  const c = session(t, { ...SSH, FAKE_LMS_STOPPED_PORT: "9" });
+  const down = await c.call("list_models");
+  assert.equal(down.isError, true);
+  assert.match(down.text, /server is not running \(last port 9\)\. Start it with server_start/);
+  assert.match((await c.call("server_start")).json().message, /^Success! Server is now running/);
+  assert.ok(sshCalls().some((call) => call.command?.endsWith(`'server' 'start'`)));
 });
 
 // ---------- models ----------

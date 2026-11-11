@@ -1,6 +1,6 @@
 # LM Studio for Claude Code
 
-Let Claude Code run your [LM Studio](https://lmstudio.ai): start and stop the server, load and unload models with the context length they need, keep conversations with local models going, hand them long jobs in the background and follow their progress.
+Let Claude Code run your [LM Studio](https://lmstudio.ai): start and stop the server, load and unload models with the context length they need, keep conversations with local models going, hand them long jobs in the background and follow their progress. LM Studio can run on the same computer or on another one that you reach with SSH, for example a desktop at the office used from a laptop over Tailscale.
 
 It is a Claude Code plugin with one small MCP server: a single file with no dependencies that needs only Node.js 20 or newer. The server also works with any other MCP client.
 
@@ -33,6 +33,7 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 - LM Studio 0.4 or newer (REST API v1), or LM Studio Bionic
 - Node.js 20 or newer (tested on 20, 22, 24 and 26)
 - The `lms` CLI that ships with LM Studio, for starting and stopping the server, memory estimates and loads with TTL or GPU settings. Everything else works over the API alone.
+- For LM Studio on another machine over SSH: an `ssh` client here, and macOS or Linux there.
 
 ## Tools
 
@@ -62,9 +63,10 @@ Sessions, tasks and model defaults are kept in `~/.lmstudio-mcp` (files readable
 
 For LM Studio on the same computer there is nothing to set: the server reads the port from `lms server status`. Without `lms` it uses `http://127.0.0.1:1234`; LM Studio Bionic listens on 1235 by default, so set the URL in that case.
 
-The plugin has two optional settings. Claude Code may say they are "not yet set"; leave them empty for LM Studio on the same computer, or set them with `/plugin configure lmstudio@lmstudio-mcp`:
+The plugin has three optional settings. Claude Code may say they are "not yet set"; leave them empty for LM Studio on the same computer, or set them with `/plugin configure lmstudio@lmstudio-mcp`:
 
-- **LM Studio URL**: only for LM Studio on another machine, or without `lms`.
+- **SSH host**: for LM Studio on another machine that you reach with SSH (see below).
+- **LM Studio URL**: for LM Studio on another machine that you reach by URL, or on this one without `lms`.
 - **API token**: only if API authentication is on in LM Studio. It is kept in the system keychain.
 
 Other MCP clients use environment variables:
@@ -73,11 +75,22 @@ Other MCP clients use environment variables:
 |---|---|
 | `LMSTUDIO_BASE_URL` | detected with `lms`, else `http://127.0.0.1:1234` |
 | `LM_API_TOKEN` | none |
-| `LMS_PATH` | `~/.lmstudio/bin/lms`, else `lms` on `PATH` |
+| `LMSTUDIO_SSH_HOST` | none; the SSH host of the machine that runs LM Studio |
+| `LMS_PATH` | `~/.lmstudio/bin/lms`, else `lms` on `PATH`; with an SSH host, the path on that machine |
 | `LMSTUDIO_TIMEOUT_MS` | `1200000` (20 min), for loading a model |
 | `LMSTUDIO_MCP_HOME` | `~/.lmstudio-mcp`, where sessions, tasks and model defaults are kept |
 
-**LM Studio on another machine:** turn on API authentication in LM Studio and set the URL and token. The token travels in clear text over plain HTTP, so prefer a private network address over exposing the server widely, or reach it through an SSH tunnel (`ssh -L 1234:127.0.0.1:1234 host`) and keep the URL at `http://127.0.0.1:1234`. `server_start`, `server_stop`, `estimate_load` and loads with TTL or GPU settings need `lms` on the same machine, so they refuse remote URLs.
+## LM Studio on another machine
+
+**Over SSH (recommended).** Set the SSH host to the machine that runs LM Studio: an alias from `~/.ssh/config` or `user@host`. The plugin then runs `lms` on that machine and sends every API request through the SSH connection (`ssh -W`). LM Studio keeps listening on localhost only, so nothing is opened on the network, and every tool works: starting the server, memory estimates, loads with TTL. `system_ram` is the RAM of that machine.
+
+It works wherever `ssh <host>` connects without asking for a password: on the same network, over Tailscale or another VPN. The other machine needs macOS or Linux. Sessions, tasks and model defaults stay on the computer where Claude Code runs, and images are read there too. When an SSH host is set, the URL setting is ignored.
+
+```bash
+claude plugin install lmstudio@lmstudio-mcp --config ssh_host=my-desktop
+```
+
+**By URL.** Turn on API authentication in LM Studio and set the URL and token. The token travels in clear text over plain HTTP, so use a private network. `server_start`, `server_stop`, `estimate_load` and loads with TTL or GPU settings need `lms`, so they are not available this way, and `system_ram` is not reported.
 
 ## Other MCP clients
 
@@ -93,7 +106,7 @@ Claude Desktop, Cursor and other clients:
 ```json
 {
   "mcpServers": {
-    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.1.1"] }
+    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.2.0"] }
   }
 }
 ```
@@ -101,7 +114,8 @@ Claude Desktop, Cursor and other clients:
 ## Security
 
 - The server talks only to the LM Studio URL. No telemetry; downloads are made by LM Studio itself.
-- `lms` runs with fixed arguments and never through a shell; values that look like command-line flags are rejected, and loads through `lms` need an exact model key.
+- `lms` runs with fixed arguments and never through a local shell; values that look like command-line flags are rejected, and loads through `lms` need an exact model key.
+- Over SSH, every argument is quoted for the shell of the other machine, and the SSH host must be a plain host name or alias, so it can't carry options.
 - `server_start` never opens the server to the network or turns on CORS; it ignores `LMS_SERVER_HOST` from the environment.
 - Images for `chat` and sessions must be absolute paths to image files under 20 MB.
 

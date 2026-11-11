@@ -2,18 +2,20 @@
 // LM Studio MCP server: lets Claude Code (or any MCP client) run a local LM Studio. It controls the API
 // server, models (list, estimate, load, unload, download, per-model defaults), sessions with context
 // control, background tasks, one-off chat and embeddings.
-// No dependencies: needs only Node.js 20+. Talks to LM Studio's REST API v1 and its `lms` CLI.
+// No dependencies: needs only Node.js 20+. Talks to LM Studio's REST API v1 and its `lms` CLI, on this
+// machine or, over SSH, on another one.
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { homedir, totalmem } from "node:os";
 import { dirname, extname, isAbsolute, join } from "node:path";
+import { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const QUICK_MS = 30_000;
 const STREAM_IDLE_MS = 10 * 60_000; // give up on a streamed answer after 10 minutes without any event
@@ -31,8 +33,8 @@ const COMPACT_PROMPT =
   "open question and the current state of the work. Write compact notes in the language of the conversation, not a chat reply.";
 
 const INSTRUCTIONS = `Tools for the user's LM Studio: server control, models, sessions, background tasks and local inference.
-- Start with server_status. If LM Studio is not reachable, call server_start (works for LM Studio on this machine).
-- Models: list_models shows what is downloaded and loaded. Check memory with estimate_load before loading. Ask the user before loading a model that needs more than about half of system RAM, and before every download_model: downloads can be tens of GB. load_model keeps a model that is already loaded; pass replace: true to reload it with other settings.
+- Start with server_status. If LM Studio is not reachable, call server_start (not available when only a URL of another machine is set).
+- Models: list_models shows what is downloaded and loaded. Check memory with estimate_load before loading. Ask the user before loading a model that needs more than about half of system_ram (in server_status: the RAM of the machine that runs LM Studio), and before every download_model: downloads can be tens of GB. load_model keeps a model that is already loaded; pass replace: true to reload it with other settings.
 - Context: model_defaults saves per-model load settings (context_length, ttl, gpu, parallel) that load_model, chat, sessions and tasks then use. When the user says a model needs a certain context (for example 262144 tokens), save it there.
 - Sessions are conversations kept in LM Studio: session_start (model, optional system_prompt and context_length), then session_send. Every answer shows how full the context is; past ${CONTEXT_WARNING_PERCENT}% run session_compact or start a new session. session_get lists the sessions or shows one.
 - Tasks run a session turn in the background: task_start returns a task_id at once; follow it with task_status (wait_seconds waits for the result) and stop it with task_cancel. Use tasks for long jobs so you can keep working meanwhile. Tasks stop when this Claude Code session ends.
@@ -44,13 +46,18 @@ const HELP = `lmstudio-mcp ${VERSION}: MCP server (stdio) for LM Studio.
 Environment (all optional):
   LMSTUDIO_BASE_URL     LM Studio API URL. Default: detected with \`lms server status\`, else http://127.0.0.1:1234
   LM_API_TOKEN          API token, if authentication is enabled in LM Studio
-  LMS_PATH              Path to the lms CLI. Default: ~/.lmstudio/bin/lms, else lms on PATH
+  LMSTUDIO_SSH_HOST     SSH host of another machine that runs LM Studio (an alias from ~/.ssh/config or user@host).
+                        lms then runs there and API requests travel through SSH; LMSTUDIO_BASE_URL is ignored
+  LMS_PATH              Path to the lms CLI (on the SSH host, if one is set). Default: ~/.lmstudio/bin/lms, else lms on PATH
   LMSTUDIO_TIMEOUT_MS   Timeout for loading a model. Default: 1200000 (20 min)
   LMSTUDIO_MCP_HOME     Where sessions, tasks and model defaults are kept. Default: ~/.lmstudio-mcp`;
 
 // setTimeout can't wait longer than 2^31-1 ms, so keep the setting in a sane range.
 const LOAD_TIMEOUT_MS = Math.min(Math.max(Math.trunc(Number(setting("LMSTUDIO_TIMEOUT_MS"))) || 20 * 60_000, 1000), 2 ** 31 - 1);
 const HOME = setting("LMSTUDIO_MCP_HOME") ?? join(homedir(), ".lmstudio-mcp");
+// LM Studio on another machine, reached over SSH: lms runs there and API requests go through `ssh -W`,
+// so nothing has to listen on the network.
+const SSH_HOST = setting("LMSTUDIO_SSH_HOST");
 
 // An error to show to the caller as it is. Errors answered by LM Studio also carry `status` (HTTP) and `param`.
 class UserError extends Error {
@@ -106,8 +113,18 @@ function sleep(ms, signal) {
   });
 }
 
-function systemRam() {
-  return `${Math.round(totalmem() / 2 ** 30)} GiB`;
+// RAM of the machine that runs LM Studio; unknown when only the URL of another machine is set.
+let sshHostRam;
+
+async function hostRam(server) {
+  const gib = (bytes) => `${Math.round(bytes / 2 ** 30)} GiB`;
+  if (!SSH_HOST) return isLocal(server.url) ? gib(totalmem()) : undefined;
+  if (!sshHostRam) {
+    const survey = await lmsJson(["runtime", "survey", "--json"]);
+    const bytes = survey?.engines?.find((engine) => engine.memoryInfo?.ramCapacity)?.memoryInfo.ramCapacity;
+    if (bytes) sshHostRam = gib(bytes);
+  }
+  return sshHostRam;
 }
 
 // ---------- local storage: sessions, tasks and model defaults ----------
@@ -193,27 +210,106 @@ function cleanOutput(text) {
     .join("\n");
 }
 
+// ---------- SSH ----------
+
+function sshHost() {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._@-]*$/.test(SSH_HOST)) throw new UserError(`"${SSH_HOST}" is not a usable SSH host. Use an alias from ~/.ssh/config or user@host.`);
+  return SSH_HOST;
+}
+
+function sshOptions() {
+  const options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"];
+  // Calls share one connection, so only the first one pays for the handshake.
+  if (process.platform !== "win32" && !/\s/.test(HOME)) {
+    mkdirSync(HOME, { recursive: true, mode: 0o700 });
+    options.push("-o", "ControlMaster=auto", "-o", `ControlPath=${join(HOME, "ssh-%C")}`, "-o", "ControlPersist=120");
+  }
+  return options;
+}
+
+function shellQuote(arg) {
+  return `'${String(arg).replace(/'/g, `'\\''`)}'`;
+}
+
+// A socket for http.request that reaches 127.0.0.1:<port> on the SSH host: the stdin and stdout of `ssh -W`.
+function sshSocket(port) {
+  const child = spawn("ssh", [...sshOptions(), "-W", `127.0.0.1:${port}`, sshHost()], { stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  const socket = new Duplex({
+    read() {
+      child.stdout.resume();
+    },
+    write(chunk, encoding, callback) {
+      child.stdin.write(chunk, encoding, callback);
+    },
+    final(callback) {
+      child.stdin.end(callback);
+    },
+    destroy(error, callback) {
+      child.kill();
+      callback(error);
+    },
+  });
+  child.stdout.on("data", (chunk) => {
+    if (!socket.push(chunk)) child.stdout.pause();
+  });
+  child.stdout.on("end", () => socket.push(null));
+  child.stderr.on("data", (chunk) => {
+    stderr = (stderr + chunk).slice(-2000);
+  });
+  child.stdin.on("error", () => {}); // a dead ssh is reported through its exit code
+  child.on("error", (error) => socket.destroy(error.code === "ENOENT" ? new Error("the ssh command was not found on this computer") : error));
+  child.on("close", (code) => {
+    if (code) socket.destroy(new Error(cleanOutput(stderr) || `ssh exited with code ${code}`));
+  });
+  // http.request calls these on its socket; over a pipe they have nothing to do.
+  for (const name of ["setTimeout", "setNoDelay", "setKeepAlive", "ref", "unref"]) socket[name] = () => socket;
+  socket.destroySoon = () => socket.destroy();
+  return socket;
+}
+
 function runLms(args, { timeoutMs = QUICK_MS, signal } = {}) {
   // Without LMS_SERVER_HOST in its environment, `lms server start` binds to 127.0.0.1 only.
   const { LMS_SERVER_HOST, ...env } = process.env;
   const options = { timeout: timeoutMs, signal, maxBuffer: 16 * 1024 * 1024, env: { ...env, NO_COLOR: "1", FORCE_COLOR: "0" } };
+  let file = lmsPath();
+  let argv = args;
+  if (SSH_HOST) {
+    // The login shell of the other machine parses this line, so every argument is quoted.
+    const lms = setting("LMS_PATH") ? shellQuote(setting("LMS_PATH")) : '"$HOME/.lmstudio/bin/lms"';
+    file = "ssh";
+    argv = [...sshOptions(), sshHost(), `env -u LMS_SERVER_HOST ${lms} ${args.map(shellQuote).join(" ")}`];
+  }
   return new Promise((resolve, reject) => {
-    execFile(lmsPath(), args, options, (error, stdout, stderr) => {
+    execFile(file, argv, options, (error, stdout, stderr) => {
       const output = { stdout: cleanOutput(stdout), stderr: cleanOutput(stderr) };
       if (!error) return resolve(output);
-      if (error.code === "ENOENT") return reject(new UserError("LM Studio CLI `lms` not found. It ships with LM Studio in ~/.lmstudio/bin; or set LMS_PATH."));
       if (error.name === "AbortError") return reject(new UserError("Cancelled."));
       if (error.killed) return reject(new UserError(`\`lms ${args.join(" ")}\` timed out after ${Math.round(timeoutMs / 1000)} s.`));
+      if (SSH_HOST) {
+        if (error.code === "ENOENT") return reject(new UserError("The ssh command was not found on this computer."));
+        if (error.code === 255) return reject(new UserError(`Cannot reach ${SSH_HOST} over SSH: ${output.stderr || error.message}`));
+        if (error.code === 126 || error.code === 127) {
+          return reject(new UserError(`LM Studio CLI \`lms\` not found on ${SSH_HOST}. It ships with LM Studio in ~/.lmstudio/bin; or set LMS_PATH to its path there.`));
+        }
+      } else if (error.code === "ENOENT") {
+        return reject(new UserError("LM Studio CLI `lms` not found. It ships with LM Studio in ~/.lmstudio/bin; or set LMS_PATH."));
+      }
       reject(new UserError(`\`lms ${args.join(" ")}\` failed: ${output.stderr || output.stdout || error.message}`));
     });
   });
 }
 
+let lmsFailure; // why the last lmsJson() call failed
+
 async function lmsJson(args) {
   try {
     const { stdout } = await runLms(args);
-    return JSON.parse(stdout.slice(stdout.search(/[[{]/)));
-  } catch {
+    const data = JSON.parse(stdout.slice(stdout.search(/[[{]/)));
+    lmsFailure = undefined;
+    return data;
+  } catch (error) {
+    lmsFailure = error.message;
     return null;
   }
 }
@@ -245,11 +341,13 @@ let serverCache = null;
 
 async function resolveServer({ fresh = false } = {}) {
   const configured = setting("LMSTUDIO_BASE_URL");
-  if (configured) return { url: configured.replace(/\/+$/, ""), source: "LMSTUDIO_BASE_URL" };
+  if (configured && !SSH_HOST) return { url: configured.replace(/\/+$/, ""), source: "LMSTUDIO_BASE_URL" };
   if (!fresh && serverCache && Date.now() - serverCache.at < 15_000) return serverCache.server;
   const status = await lmsServerStatus();
+  // Over SSH the port is only known from lms on that machine; the URL is the one LM Studio has there.
+  if (SSH_HOST && !status) throw new UserError(lmsFailure ?? `Cannot run lms on ${SSH_HOST} over SSH.`);
   const server = status?.port
-    ? { url: `http://127.0.0.1:${status.port}`, source: "lms server status", status }
+    ? { url: `http://127.0.0.1:${status.port}`, source: SSH_HOST ? `lms on ${SSH_HOST} (SSH)` : "lms server status", status }
     : { url: "http://127.0.0.1:1234", source: "default", status };
   serverCache = { server, at: Date.now() };
   return server;
@@ -281,10 +379,12 @@ function isLocal(url) {
   }
 }
 
+const SSH_HINT = "To use lms on that machine, set its SSH host (LMSTUDIO_SSH_HOST) instead of the URL.";
+
 async function requireLocal(feature) {
   const server = await resolveServer();
   if (!isLocal(server.url)) {
-    throw new UserError(`${feature} needs LM Studio on this machine (it uses the lms CLI), but LMSTUDIO_BASE_URL points to ${server.url}.`);
+    throw new UserError(`${feature} needs LM Studio on this machine (it uses the lms CLI), but LMSTUDIO_BASE_URL points to ${server.url}. ${SSH_HINT}`);
   }
   return server;
 }
@@ -318,6 +418,7 @@ async function openRequest(method, path, body, { timeoutMs = QUICK_MS, signal, s
       return new UserError(`The LM Studio server is not running${target.status.port ? ` (last port ${target.status.port})` : ""}. Start it with server_start.`);
     }
     const reason = error.code || error.cause?.code || error.message;
+    if (SSH_HOST) return new UserError(`Cannot reach LM Studio on ${SSH_HOST} over SSH (${reason}). Check \`ssh ${SSH_HOST}\`, and that its server runs (server_start).`);
     return new UserError(`Cannot reach LM Studio at ${target.url} (${reason}). Start it with server_start, or set LMSTUDIO_BASE_URL if it runs elsewhere.`);
   };
 
@@ -326,7 +427,9 @@ async function openRequest(method, path, body, { timeoutMs = QUICK_MS, signal, s
     // node:http rather than fetch: fetch gives up after 5 minutes without response headers, too short for big models.
     const url = new URL(target.url + path);
     const response = await new Promise((resolve, reject) => {
-      const req = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, { method, headers, signal: controller.signal }, resolve);
+      const options = { method, headers, signal: controller.signal };
+      if (SSH_HOST) options.createConnection = () => sshSocket(url.port);
+      const req = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, options, resolve);
       req.on("error", reject);
       req.end(payload);
     });
@@ -1008,7 +1111,8 @@ const TOOLS = [
       let lms;
       if (isLocal(server.url)) {
         const status = server.status ?? (await lmsServerStatus());
-        lms = status ? { path: lmsPath(), server_running: status.running, port: status.port } : { path: lmsPath(), available: false };
+        const path = SSH_HOST ? `${SSH_HOST}:${setting("LMS_PATH") ?? "~/.lmstudio/bin/lms"}` : lmsPath();
+        lms = status ? { path, server_running: status.running, port: status.port } : { path, available: false };
         if (status && loaded?.length) {
           const extra = await lmsLoaded();
           loaded = loaded.map((i) => ({ ...i, ...extra.get(i.instance_id) }));
@@ -1017,7 +1121,17 @@ const TOOLS = [
       const tasks = listTasks()
         .filter((t) => t.status === "running")
         .map((t) => compact({ task_id: t.id, session_id: t.session_id, phase: t.progress?.phase }));
-      return compact({ reachable: !error, base_url: server.url, url_source: server.source, loaded_models: loaded, error, running_tasks: tasks, lms_cli: lms, system_ram: systemRam() });
+      return compact({
+        reachable: !error,
+        base_url: server.url,
+        url_source: server.source,
+        ssh_host: SSH_HOST,
+        loaded_models: loaded,
+        error,
+        running_tasks: tasks,
+        lms_cli: lms,
+        system_ram: await hostRam(server),
+      });
     },
   },
   {
@@ -1140,7 +1254,7 @@ const TOOLS = [
       await assertExactKey(model, server, signal);
       const settings = { context_length: context_length ?? defaultsFor(model).context_length, gpu: gpu ?? defaultsFor(model).gpu };
       const { stdout, stderr } = await runLms(["load", model, "--estimate-only", "-y", ...lmsLoadFlags(settings)], { timeoutMs: 120_000, signal });
-      return `${stderr || stdout}\n\nSystem RAM: ${systemRam()}`;
+      return `${stderr || stdout}\n\nSystem RAM${SSH_HOST ? ` of ${SSH_HOST}` : ""}: ${(await hostRam(server)) ?? "unknown"}`;
     },
   },
   {
@@ -1173,7 +1287,7 @@ const TOOLS = [
       const server = await resolveServer();
       const lmsKeys = LMS_LOAD_KEYS.filter((k) => settings[k] !== undefined);
       if (lmsKeys.length && !isLocal(server.url)) {
-        throw new UserError(`load_model with ${lmsKeys.join(", ")} needs LM Studio on this machine (it uses the lms CLI), but LMSTUDIO_BASE_URL points to ${server.url}.`);
+        throw new UserError(`load_model with ${lmsKeys.join(", ")} needs LM Studio on this machine (it uses the lms CLI), but LMSTUDIO_BASE_URL points to ${server.url}. ${SSH_HINT}`);
       }
       if (replace && settings.identifier) throw new UserError("replace doesn't apply with identifier: an identifier always loads a separate instance.");
       return withModelLock(settings.model, async () => {

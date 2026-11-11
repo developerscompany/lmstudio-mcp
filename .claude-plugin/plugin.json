@@ -1,6 +1,6 @@
 {
   "name": "lmstudio",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Manage LM Studio from Claude Code: server, models with per-model context settings, sessions with context control, background tasks, downloads, chat and embeddings.",
   "author": {
     "name": "Rivo Agency",
@@ -17,10 +17,16 @@
     "models"
   ],
   "userConfig": {
+    "ssh_host": {
+      "type": "string",
+      "title": "SSH host of the LM Studio machine",
+      "description": "Only when LM Studio runs on another computer that you reach with SSH, for example over Tailscale: an alias from ~/.ssh/config or user@host. Nothing has to be opened on the network.",
+      "required": false
+    },
     "base_url": {
       "type": "string",
       "title": "LM Studio URL",
-      "description": "Leave empty for LM Studio on this computer: the port is detected automatically. Set it for LM Studio on another machine, e.g. http://192.168.1.20:1234.",
+      "description": "Leave empty for LM Studio on this computer (the port is detected automatically) or when the SSH host is set. Set it for LM Studio that you reach by URL, e.g. http://192.168.1.20:1234.",
       "required": false
     },
     "api_token": {
@@ -38,6 +44,7 @@
         "${CLAUDE_PLUGIN_ROOT}/server/lmstudio-mcp.mjs"
       ],
       "env": {
+        "LMSTUDIO_SSH_HOST": "${user_config.ssh_host}",
         "LMSTUDIO_BASE_URL": "${user_config.base_url}",
         "LM_API_TOKEN": "${user_config.api_token}"
       }

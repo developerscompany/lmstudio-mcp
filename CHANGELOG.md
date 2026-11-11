@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0 (2026-11-11)
+
+- LM Studio on another machine over SSH: with the new SSH host setting (`LMSTUDIO_SSH_HOST`) the plugin runs `lms` on that machine and sends API requests through `ssh -W`. Nothing is opened on the network and every tool works, including `server_start`, `estimate_load` and loads with TTL.
+- `system_ram` is the RAM of the machine that runs LM Studio: asked from `lms` over SSH, and no longer reported when only the URL of another machine is set.
+
 ## 0.1.1 (2026-11-11)
 
 Fixes from an audit of 0.1.0.
