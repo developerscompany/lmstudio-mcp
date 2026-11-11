@@ -15,7 +15,7 @@ import { dirname, extname, isAbsolute, join } from "node:path";
 import { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
-const VERSION = "0.3.1";
+const VERSION = "0.3.2";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const QUICK_MS = 30_000;
 const STREAM_IDLE_MS = 10 * 60_000; // give up on a streamed answer after 10 minutes without any event
@@ -821,7 +821,7 @@ function loadSession(id) {
 // A session runs one request at a time, also across Claude Code sessions on this computer. The holder keeps
 // sessions/<id>.lock fresh; a lock whose process is gone or that went stale is ignored.
 const LOCK_STALE_MS = 30_000;
-const heldLocks = new Map(); // session id -> heartbeat timer
+const heldLocks = new Map(); // session id -> { timer, since } of the locks this process holds
 
 // Who holds the session's lock (`holder`, null when nobody does) and, for a lock file nobody holds any
 // more, the identity of that leftover file.
@@ -875,8 +875,9 @@ function lockSession(id, holder = {}) {
     if (error.code === "EEXIST") throw new UserError(`Session ${id} is busy with another request.`);
     throw error;
   }
+  const since = now();
   try {
-    writeSync(fd, JSON.stringify({ pid: process.pid, ...holder, since: now() }));
+    writeSync(fd, JSON.stringify({ pid: process.pid, ...holder, since }));
   } finally {
     closeSync(fd);
   }
@@ -889,16 +890,23 @@ function lockSession(id, holder = {}) {
     }
   }, 5000);
   timer.unref?.();
-  heldLocks.set(id, timer);
-  return () => {
-    clearInterval(timer);
-    heldLocks.delete(id);
-    try {
-      rmSync(lockPath(id), { force: true });
-    } catch (error) {
-      log(`could not remove the lock of ${id}: ${error.message}`);
-    }
-  };
+  heldLocks.set(id, { timer, since });
+  return () => unlockSession(id);
+}
+
+function unlockSession(id) {
+  const held = heldLocks.get(id);
+  if (!held) return;
+  clearInterval(held.timer);
+  heldLocks.delete(id);
+  try {
+    // Remove the file only while it is still ours: if this process stalled for long (a sleeping laptop, say),
+    // another one may have taken the lock over.
+    const lock = readJson(lockPath(id), null);
+    if (lock?.pid === process.pid && lock.since === held.since) rmSync(lockPath(id), { force: true });
+  } catch (error) {
+    log(`could not remove the lock of ${id}: ${error.message}`);
+  }
 }
 
 async function createSession(args, signal, { load = true } = {}) {
@@ -1965,6 +1973,6 @@ process.stdin.on("end", () => {
       // other processes see the stale heartbeat instead
     }
   }
-  for (const id of heldLocks.keys()) rmSync(lockPath(id), { force: true });
+  for (const id of [...heldLocks.keys()]) unlockSession(id);
   process.exit(0);
 });

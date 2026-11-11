@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2 (2026-11-11)
+
+- A session lock is released only while it still belongs to the process that releases it. Before, a process that had stalled for more than 30 seconds (a sleeping laptop, for example) could remove the lock of the process that took the session over. Found by a local model reviewing this code through the plugin.
+
 ## 0.3.1 (2026-11-11)
 
 Found by running a real task through a fresh Claude Code session.

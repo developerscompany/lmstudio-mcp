@@ -1,6 +1,6 @@
 {
   "name": "lmstudio",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Manage LM Studio from Claude Code: server, models with per-model context settings, sessions with context control, background tasks, downloads, chat and embeddings.",
   "author": {
     "name": "Rivo Agency",

@@ -1069,6 +1069,21 @@ test("two Claude Code sessions share sessions and tasks safely", async (t) => {
   assert.deepEqual((await b.call("session_delete", { session_id: task.session_id })).json(), { deleted: [task.session_id] });
 });
 
+test("a lock that another process took over is left alone", async (t) => {
+  const c = session(t);
+  const { session_id } = (await c.call("session_start", { model: "tiny-llm" })).json();
+  const lock = join(c.home, "sessions", `${session_id}.lock`);
+  const sending = c.call("session_send", { session_id, message: "[slow] long answer" });
+  await delay(500);
+  assert.equal(JSON.parse(readFileSync(lock, "utf8")).pid > 0, true);
+  // As if this server had stalled and another process had taken the lock over meanwhile.
+  const other = JSON.stringify({ pid: process.pid, since: "2026-01-01T00:00:00.000Z" });
+  writeFileSync(lock, other);
+  assert.match((await sending).text, /^Answer 1 to: \[slow\] long answer/);
+  assert.equal(readFileSync(lock, "utf8"), other);
+  assert.match((await c.call("session_send", { session_id, message: "again" })).text, /busy with another request/);
+});
+
 test("stale tasks and locks don't block anything", async (t) => {
   const c = session(t);
   mkdirSync(join(c.home, "tasks"), { recursive: true });
