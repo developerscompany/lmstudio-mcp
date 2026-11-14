@@ -2,7 +2,9 @@
 
 Let Claude Code run your [LM Studio](https://lmstudio.ai): start and stop the server, load and unload models with the context length they need, keep conversations with local models going, hand them long jobs in the background and follow their progress. LM Studio can run on the same computer or on another one that you reach with SSH, for example a desktop at the office used from a laptop over Tailscale.
 
-It is a Claude Code plugin with one small MCP server: a single file with no dependencies that needs only Node.js 20 or newer. The server also works with any other MCP client.
+It can also hand **whole coding tasks** to a local model: the model works alone in a git worktree of your project, reads and edits files and runs your tests with tools that are locked into that worktree, and Claude gets back a short report, a diff stat and a branch to review. Claude's tokens go to the brief and the review, not to the work in between.
+
+It is a Claude Code plugin with a small MCP server: two files with no dependencies that need only Node.js 20 or newer. The server also works with any other MCP client.
 
 > Not affiliated with LM Studio or Element Labs.
 
@@ -14,6 +16,7 @@ It is a Claude Code plugin with one small MCP server: a single file with no depe
 - "Start a session with the local model as a code reviewer, then send it these files one by one."
 - "Give the local model `src/api.ts` and `docs/api.md` in the background and ask what the docs get wrong."
 - "Run this analysis on the local model in the background and tell me when it's done."
+- "Have the local model add tests for `src/lib/dates.ts` in this repo and make `pnpm test` pass. Show me the diff when it's done."
 - "How full is the context of that session? Compact it."
 - "Download granite-4-micro and tell me when it's done."
 - "Unload everything, I need the RAM."
@@ -35,6 +38,7 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 - Node.js 20 or newer (tested on 20, 22, 24 and 26)
 - The `lms` CLI that ships with LM Studio, for starting and stopping the server, memory estimates and loads with TTL or GPU settings. Everything else works over the API alone.
 - For LM Studio on another machine over SSH: an `ssh` client here, and macOS or Linux there.
+- For coding tasks: git, and macOS on the machine that runs LM Studio (the model's tools run inside `sandbox-exec`). A model trained for tool use.
 
 ## Tools
 
@@ -46,6 +50,7 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 | Downloads | `download_model`, `download_status` | Download from the LM Studio catalog or a Hugging Face URL and follow the progress |
 | Sessions | `session_start`, `session_send`, `session_get`, `session_compact`, `session_delete` | Conversations with a local model that keep their history, with text files and images, and context use after every answer |
 | Tasks | `task_start`, `task_status`, `task_cancel` | Run a prompt (with text files and images) in the background, follow its progress, wait for the result or stop it |
+| Coding tasks | `task_start` with `folder`, `task_status`, `task_cancel` | The local model works on a git worktree with sandboxed file tools and allowed commands; the result is a report, a diff stat and a branch |
 | One-off | `chat`, `embed` | A single prompt (optionally with text files and images) without history; embeddings with a similarity matrix |
 
 ## Sessions, context and tasks
@@ -61,6 +66,60 @@ Third-party marketplaces don't update automatically by default. Update with `cla
 Long calls (`session_send`, `chat`, `session_compact`) send MCP progress notifications, so Claude Code shows what the model is doing.
 
 Sessions, tasks and model defaults are kept in `~/.lmstudio-mcp` (files readable only by you). Change the folder with `LMSTUDIO_MCP_HOME`.
+
+## Coding tasks
+
+`task_start` with `folder` (a git repository on the computer where Claude Code runs) and `model` turns the local model into a coding agent:
+
+1. The plugin pushes `base` (default: `HEAD`; uncommitted changes are not included) to a bare mirror in `~/.lmstudio-mcp/repos` on the machine that runs LM Studio (this one or the SSH host) and creates a git worktree of it on a new branch `lmstudio/<task_id>`. The worktree never comes from your repository itself, so the model can't read its other branches, stashes or `.git/config`.
+2. It runs `setup` in the worktree (default: the install command for the lockfile it finds, e.g. `pnpm install --frozen-lockfile --prefer-offline`; `""` skips it). This is the only step with network access, and it runs before the model touches anything.
+3. The model gets the brief and seven tools, and works turn by turn until it answers without a tool call, which is its report. `task_status` shows the phase, the step, the context use and the latest tool calls while it runs.
+4. Whatever the model left in the worktree is committed on the branch (also when the task failed or was cancelled) and the branch is fetched into your repository. The patch is saved in `~/.lmstudio-mcp/tasks/<task_id>.patch` and the worktree is deleted: only the commit is handed on, never the folder the model worked in. Without changes there is no branch.
+
+The final `task_status` is short on purpose: the model's report (marked as data from an untrusted model), `git diff --stat`, the branch and commit, the last result of each check the model ran, failed tool calls, and counts (steps, tool calls, tokens, seconds in the model and in tools). `show_calls: true` lists every tool call.
+
+**The model's tools**
+
+| Tool | What it does |
+|---|---|
+| `list_files` | A folder, or with `recursive` every file below it (without what `.gitignore` ignores) |
+| `read_file` | A text file with line numbers, in parts of up to 2,000 lines |
+| `search` | A regular expression over the project's files, `file:line: text` |
+| `write_file`, `edit_file`, `delete_file` | Create or replace a file; replace exact text (must be unique unless `replace_all`); delete a file |
+| `run_command` | One allowed command, optionally with more arguments, without a shell; exit code and output (head and tail) |
+
+The allowed commands are `commands` (default: the `test`, `typecheck` and `lint` scripts of `package.json`, e.g. `pnpm test`) plus `git status`, `git diff`, `git log` and `git show`. The model may add arguments (`pnpm test src/foo.test.ts`), but not pipes, `&&`, redirection, variables or a different program.
+
+**The sandbox.** The model is treated as untrusted (some local models have had their refusals removed), so the limits don't depend on it behaving:
+
+- File tools resolve every path inside the worktree, also after following symbolic links, and never touch `.git`.
+- The tools and every command they start run under macOS `sandbox-exec` with a deny-by-default profile: no network at all (localhost included), writes only inside the worktree and the task's own temp and home folders, reads of the system, the worktree and its git folder but nothing else of your home folder (no `~/.ssh`, keychains, other projects, `.env` files of the main checkout), and no terminals. Commands get a clean environment: no tokens or SSH agent, `HOME` is an empty folder of the task, `CI=1`.
+- An allowed command still runs code the model may have written (a test file, a `package.json` script), so the sandbox, not the allowlist, is what holds. `osascript` and `open` can't reach other apps from inside it.
+- The trusted steps (creating the worktree, committing) run git without hooks and use the git folders recorded when the worktree was created, never the worktree's `.git` file, which the model could have changed. A git repository the model created inside the worktree is left out of the commit.
+- Commands have a timeout (default 10 minutes, at most 30), and their process group is killed when they end. A process that detaches itself survives that, so before the commit the task folder is renamed: the sandbox grants writes by path, so such a process can no longer change anything, and the folder is deleted afterwards.
+
+The branch is unreviewed code from a local model: read the diff before you run it outside the sandbox. The model's report is data too, and Claude is told not to follow instructions in it.
+
+**Example.** What Claude sends:
+
+```json
+{
+  "folder": "/Users/me/code/app",
+  "model": "qwen3.8-flash",
+  "prompt": "Add unit tests for packages/config/src/load-env.ts in packages/config/test/load-env.test.ts ... Run the package's tests, typecheck and lint and make them pass.",
+  "commands": ["pnpm --filter @app/config test", "pnpm --filter @app/config typecheck", "pnpm --filter @app/config lint"],
+  "setup": "pnpm install --frozen-lockfile --prefer-offline --filter @app/config...",
+  "max_steps": 40
+}
+```
+
+and then `task_status` with `wait_seconds` until the report arrives. Write the brief like one for a new colleague: the goal, the files to start from, the constraints and how to check the work. Narrow `commands` to the part of the project the task touches: whole-repository checks are slow and may need services the sandbox doesn't reach, such as a database.
+
+How it went in practice: on a Mac Studio running an 85 GB MoE model (IQ3, 256k context) over SSH from a laptop, writing seven unit tests for a module of a pnpm monorepo and getting its tests, typecheck and lint to pass took 6.5 minutes: 28 model turns, 43 tool calls, none malformed, 9% of the context. The review still found a test that proved less than the model's report claimed, which is why the review stays with Claude.
+
+Limits: `max_steps` (default 60 model turns) and `max_minutes` (default 60). At either limit the model is asked for its report. Past half of the context, old tool output is shortened. `reasoning: "off"` makes each turn faster for simple tasks; `system_prompt` adds project notes to the agent's instructions.
+
+**Why not MCP servers in LM Studio?** LM Studio can give a model MCP servers from its `mcp.json` (`integrations`), and LM Studio then runs the tool loop itself. Here the plugin runs the loop through LM Studio's OpenAI-compatible chat API instead, so that each task gets its own worktree as the tools' root (a static `mcp.json` entry has one root for everybody), every tool call is visible in `task_status` and limited by steps, time and cancel, and nothing has to be configured in LM Studio. The tools themselves are [`server/workspace.mjs`](server/workspace.mjs), shipped with the plugin and copied to the LM Studio machine over SSH when needed.
 
 ## Configuration
 
@@ -81,13 +140,15 @@ Other MCP clients use environment variables:
 | `LMSTUDIO_SSH_HOST` | none; the SSH host of the machine that runs LM Studio |
 | `LMS_PATH` | `~/.lmstudio/bin/lms`, else `lms` on `PATH`; with an SSH host, the path on that machine |
 | `LMSTUDIO_TIMEOUT_MS` | `1200000` (20 min), for loading a model |
-| `LMSTUDIO_MCP_HOME` | `~/.lmstudio-mcp`, where sessions, tasks and model defaults are kept |
+| `LMSTUDIO_MCP_HOME` | `~/.lmstudio-mcp`, where sessions, tasks, model defaults and coding worktrees are kept |
 
 ## LM Studio on another machine
 
 **Over SSH (recommended).** Set the SSH host to the machine that runs LM Studio: an alias from `~/.ssh/config` or `user@host`. The plugin then runs `lms` on that machine and sends every API request through the SSH connection (`ssh -W`). LM Studio keeps listening on localhost only, so nothing is opened on the network, and every tool works: starting the server, memory estimates, loads with TTL. `system_ram` is the RAM of that machine.
 
 It works wherever `ssh <host>` connects without asking for a password: on the same network, over Tailscale or another VPN. The other machine needs macOS or Linux. Sessions, tasks and model defaults stay on the computer where Claude Code runs, and images are read there too. When an SSH host is set, the URL setting is ignored.
+
+Coding tasks run on the LM Studio machine, so the model's builds and tests use that machine's CPU and memory. It needs git and Node.js there (Homebrew's is found), and the project's toolchain (for example pnpm; a `.nvmrc` picks Homebrew's `node@<version>`).
 
 ```bash
 claude plugin install lmstudio@lmstudio-mcp --config ssh_host=my-desktop
@@ -109,7 +170,7 @@ Claude Desktop, Cursor and other clients:
 ```json
 {
   "mcpServers": {
-    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.3.2"] }
+    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.4.0"] }
   }
 }
 ```
@@ -121,16 +182,17 @@ Claude Desktop, Cursor and other clients:
 - Over SSH, every argument is quoted for the shell of the other machine, and the SSH host must be a plain host name or alias, so it can't carry options.
 - `server_start` never opens the server to the network or turns on CORS; it ignores `LMS_SERVER_HOST` from the environment.
 - Images and text files for `chat`, sessions and tasks must be absolute paths: images under 20 MB, text files under 2 MB. They are read on the computer where Claude Code runs and sent only to LM Studio.
+- Coding tasks: see [the sandbox](#coding-tasks). The base commit goes only to the SSH host you set, and the branch comes back from there.
 
 ## Development
 
 ```bash
-npm test                          # tests against a fake LM Studio and a fake lms, no network
+npm test                          # tests against a fake LM Studio, a fake lms and a fake ssh, no network (the sandbox tests need macOS)
 claude plugin validate . --strict
 claude --plugin-dir .             # try the plugin without installing it
 ```
 
-The whole server is [`server/lmstudio-mcp.mjs`](server/lmstudio-mcp.mjs): MCP over stdio (JSON-RPC 2.0), protocol versions 2024-11-05 to 2025-11-25.
+The server is [`server/lmstudio-mcp.mjs`](server/lmstudio-mcp.mjs): MCP over stdio (JSON-RPC 2.0), protocol versions 2024-11-05 to 2025-11-25. [`server/workspace.mjs`](server/workspace.mjs) is the helper of coding tasks: worktrees, the sandbox and the model's tools.
 
 ## License
 

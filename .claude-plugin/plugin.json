@@ -1,7 +1,7 @@
 {
   "name": "lmstudio",
-  "version": "0.3.2",
-  "description": "Manage LM Studio from Claude Code: server, models with per-model context settings, sessions with context control, background tasks, downloads, chat and embeddings.",
+  "version": "0.4.0",
+  "description": "Manage LM Studio from Claude Code: server, models with per-model context settings, sessions with context control, background tasks, coding tasks that a local model does in a sandboxed git worktree, downloads, chat and embeddings.",
   "author": {
     "name": "Rivo Agency",
     "url": "https://github.com/developerscompany"

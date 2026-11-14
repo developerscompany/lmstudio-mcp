@@ -9,7 +9,7 @@
     {
       "name": "lmstudio",
       "source": "./",
-      "description": "Manage LM Studio from Claude Code: server, models and context, sessions, background tasks, downloads, chat and embeddings.",
+      "description": "Manage LM Studio from Claude Code: server, models and context, sessions, background tasks, sandboxed coding tasks for a local model, downloads, chat and embeddings.",
       "category": "development",
       "tags": [
         "lmstudio",

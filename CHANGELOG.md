@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 (2026-11-14)
+
+Coding tasks: Claude hands a whole coding job to a local model and only writes the brief and reviews the result.
+
+- `task_start` with `folder` (a git repository) runs the local model as a coding agent in its own git worktree on a new branch `lmstudio/<task_id>`, on the machine that runs LM Studio. Over SSH the base commit is pushed to a mirror there and the branch is fetched back when the task ends.
+- The model gets seven tools: `list_files`, `read_file`, `search`, `write_file`, `edit_file`, `delete_file` and `run_command`. Commands come from an allowlist (`commands`, default: the project's test, typecheck and lint scripts, plus read-only git) and run without a shell.
+- The tools and every command run under macOS `sandbox-exec` with a deny-by-default profile: no network, writes only inside the worktree, nothing of the home folder outside it readable, no terminals. The worktree comes from a bare mirror, never from the repository itself.
+- The final commit runs git without hooks, ignores the worktree's `.git` file and leaves out git repositories the model created. Before it the task folder is renamed, so a process the model left running loses its write access; then the worktree is deleted. These came from a security review of the first version.
+- `setup` (default: the install command for the lockfile) runs before the model starts. `max_steps`, `max_minutes` and `task_cancel` bound the task; the work done so far is committed in every case.
+- The model's report is marked as data from an untrusted model.
+- `task_status` shows the steps, the latest tool calls and the context use while a coding task runs, and at the end the model's report, `git diff --stat`, the branch, the checks it ran and the patch file. `show_calls` lists every tool call.
+- New file `server/workspace.mjs`: the worktree, the sandbox and the model's tools. It is copied to the SSH host when needed.
+
 ## 0.3.2 (2026-11-11)
 
 - A session lock is released only while it still belongs to the process that releases it. Before, a process that had stalled for more than 30 seconds (a sleeping laptop, for example) could remove the lock of the process that took the session over. Found by a local model reviewing this code through the plugin.
