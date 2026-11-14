@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 (2026-11-14)
+
+- The sandbox of coding tasks never opens the home folder, a folder above it or a folder right below it for reading. Before, a Node installed in `~/bin` (or a PATH entry there) would have opened the whole home folder. The folders that hold keys and tokens (`~/.ssh`, `~/.config`, `~/.aws`, the keychains and others) are closed explicitly as well. Found by an automated security review of 0.4.0.
+
 ## 0.4.0 (2026-11-14)
 
 Coding tasks: Claude hands a whole coding job to a local model and only writes the brief and reviews the result.

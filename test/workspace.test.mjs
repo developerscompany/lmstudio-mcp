@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { after, before, test } from "node:test";
@@ -174,6 +174,8 @@ test("commands run in a sandbox: no network, no writes or reads outside, a home 
   assert.match(await node(`require('fs').writeFileSync('${join(work, "escaped.txt")}','x')`), /EPERM/);
   assert.equal(existsSync(join(work, "escaped.txt")), false);
   assert.match(await node(`console.log(require('fs').readFileSync('${outside}','utf8'))`), /EPERM/);
+  // The real home folder, and its secrets in particular, stay closed.
+  assert.match(await node(`for (const p of ['${homedir()}','${join(homedir(), ".ssh")}']) { try { require('fs').readdirSync(p); console.log('LISTED', p) } catch (e) { console.log(p, e.code) } }`), /^(?![\s\S]*^LISTED)/m);
   assert.match(await node("console.log('home=' + require('os').homedir())"), new RegExp(`home=${join(home, "work", "t_sandbox", "home")}`));
   assert.match(await node("require('fs').writeFileSync('inside.txt','ok');console.log('wrote')"), /wrote/);
   assert.match(await node("console.log(Object.keys(process.env).filter((k)=>/SSH|TOKEN|KEY/.test(k)).join(',') || 'clean')"), /clean/);

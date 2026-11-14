@@ -304,18 +304,35 @@ function sbString(path) {
   return `"${path.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+// Folders the sandbox may never read, whatever else is opened: they hold keys, tokens and credentials.
+const SECRET_PLACES = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config", ".netrc", ".npmrc", ".pgpass", ".git-credentials", ".claude.json", "Library/Keychains", ".lmstudio"];
+
+// A folder to open for reading, or undefined when that would open the home folder, a folder above it, or a folder
+// right below it (~/.config, ~/Library, ~/bin...): a Node installed in ~/bin must not open the whole home folder.
+function narrowRead(path) {
+  const resolved = real(path) ?? path;
+  const home = real(homedir()) ?? homedir();
+  const down = relative(home, resolved);
+  if (down === "" || (!down.startsWith("..") && !isAbsolute(down))) return down.split(sep).filter(Boolean).length >= 2 ? resolved : undefined;
+  const up = relative(resolved, home);
+  return up === "" || (!up.startsWith("..") && !isAbsolute(up)) ? undefined : resolved;
+}
+
 function sandboxProfile(task, path) {
   const dir = dirname(task.root);
   const writable = [task.root, join(dir, "tmp"), join(dir, "home")].map(real).filter(Boolean);
-  const readable = [...writable, task.git_dir, task.common_dir, SCRIPT, dirname(dirname(real(process.execPath) ?? process.execPath))];
+  const node = real(process.execPath) ?? process.execPath;
+  // Node's installation folder, else its bin folder, else only the program itself.
+  const readable = [...writable, task.git_dir, task.common_dir, SCRIPT, narrowRead(dirname(dirname(node))) ?? narrowRead(dirname(node)) ?? node];
   // git and other developer tools from Xcode or the Command Line Tools (the latter live in /Library)
   const developer = spawnSync("xcode-select", ["-p"], { encoding: "utf8" }).stdout?.trim();
   if (developer) readable.push(developer.includes(".app/") ? developer.slice(0, developer.indexOf(".app/") + 4) : developer);
   if (pnpmHome()) readable.push(join(pnpmHome(), ".tools"));
   // Programs on PATH that live in the home folder (nvm, say): their installation folder.
-  for (const entry of path.split(":")) if (entry.startsWith(`${homedir()}/`)) readable.push(dirname(entry));
+  for (const entry of path.split(":")) if (entry.startsWith(`${homedir()}/`)) readable.push(narrowRead(dirname(entry)) ?? narrowRead(entry));
   const system = ["/usr", "/bin", "/sbin", "/System", "/Library", "/opt", "/private/etc", "/private/var/db"];
-  const subpaths = (paths) => [...new Set(paths.map((p) => real(p) ?? p))].map((p) => `(subpath ${sbString(p)})`).join(" ");
+  const subpaths = (paths) => [...new Set(paths.filter(Boolean).map((p) => real(p) ?? p))].map((p) => `(subpath ${sbString(p)})`).join(" ");
+  const secrets = SECRET_PLACES.map((place) => join(homedir(), place));
   return `(version 1)
 (deny default)
 (allow process-exec process-fork)
@@ -328,7 +345,7 @@ function sandboxProfile(task, path) {
 (allow file-read* (literal "/") (literal "/etc") (literal "/var") (literal "/tmp") ${subpaths(system)})
 (allow file-read* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom") (subpath "/dev/fd"))
 (allow file-read* ${subpaths(readable)})
-(deny file-read* (subpath "/opt/homebrew/var") (subpath "/usr/local/var"))
+(deny file-read* (subpath "/opt/homebrew/var") (subpath "/usr/local/var") ${subpaths(secrets)})
 (allow file-write* ${subpaths(writable)} (literal "/dev/null") (literal "/dev/zero") (literal "/dev/stdout") (literal "/dev/stderr") (subpath "/dev/fd"))
 (allow file-ioctl (literal "/dev/null"))
 `;

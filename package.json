@@ -1,6 +1,6 @@
 {
   "name": "lmstudio-mcp",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "MCP server and Claude Code plugin for LM Studio: server, models and context length, sessions, background tasks, coding tasks in a sandboxed git worktree, downloads, chat and embeddings. No dependencies.",
   "type": "module",
   "bin": {

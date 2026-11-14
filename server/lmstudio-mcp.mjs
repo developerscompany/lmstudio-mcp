@@ -17,7 +17,7 @@ import { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const QUICK_MS = 30_000;
 const STREAM_IDLE_MS = 10 * 60_000; // give up on a streamed answer after 10 minutes without any event

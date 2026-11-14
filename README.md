@@ -170,7 +170,7 @@ Claude Desktop, Cursor and other clients:
 ```json
 {
   "mcpServers": {
-    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.4.0"] }
+    "lmstudio": { "command": "npx", "args": ["-y", "github:developerscompany/lmstudio-mcp#v0.4.1"] }
   }
 }
 ```
